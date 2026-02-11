@@ -253,6 +253,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .badge.win { background: #064e3b; color: #22c55e; }
   .badge.loss { background: #450a0a; color: #ef4444; }
   .badge.open { background: #1e3a5f; color: #60a5fa; }
+  .badge.rejected { background: #451a03; color: #f97316; }
+  .badge.unfilled { background: #27272a; color: #a1a1aa; }
   .badge.paper { background: #3b3514; color: #eab308; font-size: 9px; margin-left: 4px; }
 
   .footer { max-width: 1100px; margin: 20px auto 0; text-align: center; font-size: 10px; color: #475569; }
@@ -437,7 +439,10 @@ function renderTradesTable(data) {
   for (const t of trades) {
     const isSettled = t.settled === 1;
     const won = t.pnl > 0;
-    const resultBadge = !isSettled ? '<span class="badge open">OPEN</span>' :
+    const st = (t.order_status || '').toLowerCase();
+    const resultBadge = st === 'rejected' ? '<span class="badge rejected">REJECTED</span>' :
+      st === 'unfilled' ? '<span class="badge unfilled">UNFILLED</span>' :
+      !isSettled ? '<span class="badge open">OPEN</span>' :
       (won ? '<span class="badge win">WIN</span>' : '<span class="badge loss">LOSS</span>');
     const paperBadge = t.paper_trade ? '<span class="badge paper">PAPER</span>' : '';
     const ts = (t.timestamp || '').replace('T', ' ').slice(0, 19);
