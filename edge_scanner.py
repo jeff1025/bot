@@ -308,6 +308,26 @@ CATEGORY_CONFIGS = {
     ),
 }
 
+
+def _apply_dashboard_overrides():
+    """
+    Load config overrides from the dashboard JSON file and apply to CATEGORY_CONFIGS.
+    The dashboard writes per-category min_edge_pct values to this file.
+    Called at the start of each scan cycle so changes take effect within ~15s.
+    """
+    if not os.path.exists(OVERRIDES_PATH):
+        return
+    try:
+        with open(OVERRIDES_PATH, "r") as f:
+            overrides = json.load(f)
+        for cat_key, vals in overrides.items():
+            if cat_key in CATEGORY_CONFIGS and "min_edge_pct" in vals:
+                new_val = max(5.0, min(50.0, float(vals["min_edge_pct"])))
+                CATEGORY_CONFIGS[cat_key].min_edge_pct = new_val
+    except (json.JSONDecodeError, IOError, TypeError):
+        pass
+
+
 # =============================================================================
 # LOGGING SETUP
 # =============================================================================
@@ -316,6 +336,7 @@ LOG_DIR = os.path.join(os.path.expanduser("~"), ".edge_scanner")
 os.makedirs(LOG_DIR, exist_ok=True)
 
 DB_PATH = os.path.join(LOG_DIR, "trades.db")
+OVERRIDES_PATH = os.path.join(LOG_DIR, "dashboard_overrides.json")
 
 logger = logging.getLogger("edge_scanner")
 logger.setLevel(logging.DEBUG)
@@ -2214,6 +2235,9 @@ class EdgeScanner:
             "best_gross_edge": 0.0, "best_ticker": "",
             "near_misses": 0, "no_edge": 0, "price_filtered": 0, "time_filtered": 0,
         }
+
+        # Apply dashboard config overrides (min_edge_pct sliders)
+        _apply_dashboard_overrides()
 
         # Global checks
         if self.positions.count_total() >= MAX_OPEN_POSITIONS_GLOBAL:
