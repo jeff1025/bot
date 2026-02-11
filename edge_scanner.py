@@ -2395,6 +2395,95 @@ class EdgeScanner:
             )
             self.db.commit()
 
+    # ── Startup Backfill ───────────────────────────────────────────────────
+
+    async def backfill_unsettled_trades(self):
+        """
+        On startup, find any unsettled bot trades from previous sessions
+        and resolve them. Fetches market data from Kalshi to backfill
+        close_time and determine settlement outcome.
+
+        Only touches trades created by this bot (trade_id LIKE 'ES-%').
+        """
+        rows = self.db.execute(
+            """
+            SELECT trade_id, ticker, category, direction, contracts, cost, fee,
+                   close_time, order_status
+            FROM trades
+            WHERE settled=0
+              AND trade_id LIKE 'ES-%'
+              AND order_status IN ('filled', 'paper_filled')
+            ORDER BY timestamp ASC
+            """,
+        ).fetchall()
+
+        if not rows:
+            logger.info("BACKFILL: No unsettled trades from previous sessions")
+            return
+
+        logger.info(f"BACKFILL: Found {len(rows)} unsettled trades from previous sessions")
+        now = datetime.now(timezone.utc)
+        settled_count = 0
+        backfilled_count = 0
+
+        # Cache market data to avoid duplicate API calls for same ticker
+        market_cache = {}
+
+        for row in rows:
+            trade_id, ticker, category, direction, contracts, cost, fee, close_time_str, order_status = row
+
+            try:
+                # Fetch market data (cached per ticker)
+                if ticker not in market_cache:
+                    market_data = await self.api.get_market(ticker)
+                    market_cache[ticker] = market_data
+
+                market_data = market_cache[ticker]
+
+                # Backfill close_time if missing
+                if not close_time_str:
+                    ct_str = market_data.get("close_time") or market_data.get("expiration_time")
+                    if ct_str:
+                        self.db.execute(
+                            "UPDATE trades SET close_time=? WHERE trade_id=?",
+                            (ct_str, trade_id),
+                        )
+                        self.db.commit()
+                        backfilled_count += 1
+                        logger.info(f"BACKFILL: Set close_time for {trade_id} ({ticker}) -> {ct_str}")
+
+                # Check settlement
+                status = market_data.get("status", "")
+                result = market_data.get("result", "")
+
+                if status == "settled" or result in ("yes", "no"):
+                    side = "yes" if direction == "up" else "no"
+                    won = (side == "yes" and result == "yes") or (side == "no" and result == "no")
+
+                    payout = (contracts or 0) * 1.0 if won else 0.0
+                    pnl = payout - (cost or 0) - (fee or 0)
+
+                    self._settle_trade_in_db(trade_id, category, result, won, payout, pnl, cost or 0, now)
+                    settled_count += 1
+
+                    logger.info(
+                        f"BACKFILL SETTLE {ticker} | {'WIN' if won else 'LOSS'} | "
+                        f"result={result} | payout=${payout:.2f} cost=${cost or 0:.2f} "
+                        f"fee=${fee or 0:.2f} | P&L=${pnl:+.2f}"
+                    )
+                else:
+                    logger.info(
+                        f"BACKFILL: {trade_id} ({ticker}) still active (status={status}), will check later"
+                    )
+
+            except Exception as e:
+                logger.warning(f"BACKFILL error for {trade_id} ({ticker}): {e}")
+
+        logger.info(
+            f"BACKFILL complete: {settled_count}/{len(rows)} settled, "
+            f"{backfilled_count} close_times backfilled"
+        )
+
     # ── Shadow Settlement ─────────────────────────────────────────────────
 
     async def check_shadow_settlements(self):
@@ -2824,6 +2913,9 @@ class EdgeScanner:
                 logger.info(f"Kalshi balance: ${balance:.2f} (paper mode — no real trades)")
             except Exception as e:
                 logger.warning(f"Kalshi connection failed (paper mode OK): {e}")
+
+        # Backfill unsettled trades from previous sessions
+        await self.backfill_unsettled_trades()
 
         # Start Chainlink feed
         self.chainlink.start()
