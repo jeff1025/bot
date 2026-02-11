@@ -15,14 +15,19 @@ SETUP:
 # This sets HTTP_PROXY/HTTPS_PROXY before requests/httpx are imported
 # so that py_clob_client uses the proxy for all PM API calls
 import os
-_PROXY_CONFIG = {
-    "enabled": True,
-    "host": "82.23.103.113",
-    "port": 7840,
-    "username": "ufngmejp",
-    "password": "jf9a4s0axthn",
-}
-if _PROXY_CONFIG["enabled"]:
+import json as _json_early
+# Load proxy config from config.json instead of hardcoding credentials
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+_config_path = os.path.join(_script_dir, "config.json")
+_PROXY_CONFIG = {"enabled": False}
+if os.path.exists(_config_path):
+    try:
+        with open(_config_path) as _f:
+            _cfg_data = _json_early.load(_f)
+        _PROXY_CONFIG = _cfg_data.get("residential_proxy", {"enabled": False})
+    except Exception:
+        pass
+if _PROXY_CONFIG.get("enabled", False):
     _proxy_url = f"http://{_PROXY_CONFIG['username']}:{_PROXY_CONFIG['password']}@{_PROXY_CONFIG['host']}:{_PROXY_CONFIG['port']}"
     os.environ["HTTP_PROXY"] = _proxy_url
     os.environ["HTTPS_PROXY"] = _proxy_url
@@ -215,6 +220,31 @@ CONFIG = {
         "concurrent_requests": 10,         # Max concurrent HTTP requests
     },
     
+    # ==========================================================================
+    # TIME-OF-DAY FILTER
+    # ==========================================================================
+    # Data shows 22:00-04:00 UTC consistently loses money (-$45 over 63 trades)
+    # US market close volatility (17:00-18:00 ET = 22:00-23:00 UTC) breaks
+    # the model, and overnight low-liquidity hours amplify slippage.
+    "time_filter": {
+        "enabled": True,
+        "blocked_hours_utc": [22, 23, 0, 1, 2, 3],  # UTC hours to skip trading
+        "log_blocked": True,  # Log when trades are blocked by time filter
+    },
+
+    # ==========================================================================
+    # EXECUTION SLIPPAGE BUFFER
+    # ==========================================================================
+    # Real data shows Kalshi effective slippage of 11-16% vs expected 3%.
+    # This buffer is SUBTRACTED from net edge before comparing to threshold.
+    # It accounts for: orderbook movement between scan and fill, partial fills,
+    # and Kalshi's slower execution vs PM.
+    "execution_buffer": {
+        "enabled": True,
+        "kalshi_slippage_pct": 2.0,   # Extra % deducted from edge for K execution risk
+        "pm_slippage_pct": 0.5,       # Extra % deducted for PM execution risk
+    },
+
     "test_mode": {
         "enabled": True,
         "max_contracts_per_trade": 10,
@@ -232,12 +262,18 @@ CONFIG = {
     "max_order_value_usd": 7.0,  # Max $ to spend on one leg of a trade
     "balance_refresh_seconds": 30,  # Refresh balance every 30s (was 10s - less API spam)
     
-    # FEES
-    # Polymarket 15-min crypto: Variable fee based on price (highest at 50¢, ~0% at extremes)
-    # - At 50¢: ~3% of trade value
-    # - At 25¢ or 75¢: ~1.5% of trade value  
-    # - Near 0¢ or $1: ~0%
-    # Kalshi: ~1% average on profit
+    # ==========================================================================
+    # MINIMUM STRIKE MARGIN
+    # ==========================================================================
+    # Data shows ALL trades cluster within 0.2-0.4% of strike — pure coin flips.
+    # Enforce a minimum distance from strike so the model has actual predictive value.
+    "min_strike_margin": {
+        "enabled": True,
+        "min_pct": 0.5,           # Spot must be at least 0.5% from strike to trade
+        "log_blocked": True,
+    },
+
+    # FEES (reference values — actual calculations use exact platform formulas)
     "polymarket_fee_pct": 2.0,  # Conservative estimate (actual varies 0-3%)
     "kalshi_fee_pct": 1.0,      # ~1% on contracts
     "min_depth_usd": 50,        # Lowered - we're trading small
@@ -254,13 +290,10 @@ CONFIG = {
     # Routes PM traffic through Webshare residential proxy to avoid VPN latency
     # Kalshi still uses VPN directly (they geo-block without it)
     
-    "residential_proxy": {
-        "enabled": True,
-        "host": "82.23.103.113",
-        "port": 7840,
-        "username": "ufngmejp",
-        "password": "jf9a4s0axthn",
-    },
+    # Proxy credentials loaded from config.json at startup (see top of file)
+    # Add a "residential_proxy" section to config.json with:
+    #   enabled, host, port, username, password
+    "residential_proxy": _PROXY_CONFIG,
     
 }
 
@@ -6407,7 +6440,19 @@ class Scanner:
     async def find_scored_opportunities(self, pairs: list) -> list[ScoredOpportunity]:
         """Find and score opportunities using momentum strategy"""
         opportunities = []
-        
+
+        # TIME-OF-DAY FILTER: Block trading during historically unprofitable hours
+        time_cfg = CONFIG.get("time_filter", {})
+        if time_cfg.get("enabled", False):
+            current_hour_utc = datetime.now(timezone.utc).hour
+            blocked_hours = time_cfg.get("blocked_hours_utc", [])
+            if current_hour_utc in blocked_hours:
+                if time_cfg.get("log_blocked", False):
+                    if not hasattr(self, '_time_filter_logged_hour') or self._time_filter_logged_hour != current_hour_utc:
+                        log_print(f"  [TIME FILTER] Blocking trades during UTC hour {current_hour_utc:02d}:00 (in blocked_hours_utc)")
+                        self._time_filter_logged_hour = current_hour_utc
+                return []
+
         # Filter pairs with valid tokens
         # Note: Pairs with assumed strikes (Kalshi TBD) are now allowed through pairing logic
         valid_pairs = [p for p in pairs if p.is_valid and p.polymarket.token_id]
@@ -6816,19 +6861,43 @@ class Scanner:
                             avg_strike=_avg_strike2
                         )
                     
-                    if net_edge_pct < required_roi:
+                    # EXECUTION SLIPPAGE BUFFER: Reduce effective edge to account for
+                    # real-world execution costs (orderbook movement, fill latency)
+                    exec_cfg = CONFIG.get("execution_buffer", {})
+                    adjusted_net_edge = net_edge_pct
+                    if exec_cfg.get("enabled", False):
+                        slippage_deduction = exec_cfg.get("kalshi_slippage_pct", 0) + exec_cfg.get("pm_slippage_pct", 0)
+                        adjusted_net_edge = net_edge_pct - slippage_deduction
+
+                    # MINIMUM STRIKE MARGIN: Ensure spot is far enough from strike
+                    # to avoid pure coin-flip trades where model has no edge
+                    margin_cfg = CONFIG.get("min_strike_margin", {})
+                    if margin_cfg.get("enabled", False):
+                        _spot_for_margin = _rtds_price2
+                        _strike_for_margin = _avg_strike2
+                        if _spot_for_margin and _strike_for_margin and _strike_for_margin > 0:
+                            spot_strike_pct = abs(_spot_for_margin - _strike_for_margin) / _strike_for_margin * 100
+                            min_margin = margin_cfg.get("min_pct", 0.5)
+                            if spot_strike_pct < min_margin:
+                                if margin_cfg.get("log_blocked", False) and score >= 35:
+                                    self._log_filtered(pair.polymarket.underlying, score, net_edge_pct,
+                                        f"strike_margin ({spot_strike_pct:.3f}% < {min_margin}% min)")
+                                continue
+
+                    if adjusted_net_edge < required_roi:
                         # ROI doesn't justify the risk
                         if score >= 35:
                             fav_tag = " [FAV]" if is_strike_favorable else (" [UNFAV]" if is_strike_unfavorable else "")
+                            slippage_note = f" adj={adjusted_net_edge:.1f}%" if adjusted_net_edge != net_edge_pct else ""
                             if is_assumed_strike:
                                 self._log_filtered(pair.polymarket.underlying, score, net_edge_pct,
-                                    f"roi_too_low (need {required_roi:.1f}% for assumed strike)")
+                                    f"roi_too_low (need {required_roi:.1f}% for assumed strike{slippage_note})")
                             elif is_late_window_trade:
                                 self._log_filtered(pair.polymarket.underlying, score, net_edge_pct,
-                                    f"roi_too_low (need {required_roi:.1f}% for {strike_diff:.4f}% diff + {pct_elapsed:.0f}% elapsed{fav_tag})")
+                                    f"roi_too_low (need {required_roi:.1f}% for {strike_diff:.4f}% diff + {pct_elapsed:.0f}% elapsed{fav_tag}{slippage_note})")
                             else:
                                 self._log_filtered(pair.polymarket.underlying, score, net_edge_pct,
-                                    f"roi_too_low (need {required_roi:.1f}% for {strike_diff:.4f}% strike diff{fav_tag})")
+                                    f"roi_too_low (need {required_roi:.1f}% for {strike_diff:.4f}% strike diff{fav_tag}{slippage_note})")
                         continue
                     
                     # Check if Kalshi leg would hit minimum order size ($1 minimum)
@@ -7611,7 +7680,10 @@ class Scanner:
                     balance_drop = float(self.pm._pre_order_balance.cash) - float(current_pm_balance.cash)
                     
                     # If balance dropped by roughly the expected amount, PM filled
-                    if balance_drop > expected_cost * 0.5:  # At least 50% of expected
+                    # Lowered from 50% to 30% — partial fills and slippage can make
+                    # the actual cost much less than expected, causing false negatives
+                    # that lead to unnecessary K sellbacks
+                    if balance_drop > expected_cost * 0.3:  # At least 30% of expected
                         log_print(f"      [Parallel] ⚠️ PM PHANTOM FILL DETECTED: Balance dropped ${balance_drop:.2f} (expected ~${expected_cost:.2f})")
                         pm_phantom_detected = True
                         pm_filled = True  # Override - PM actually filled

@@ -619,26 +619,36 @@ class VolTracker:
     def get_best_vol(self, asset: str) -> Optional[float]:
         """
         Return the best available vol estimate for pricing.
-        
+
         Priority:
         1. 15-min rolling window (most stable for 15-min binary pricing)
         2. 5-min rolling window (less data but still window-appropriate)
         3. Fast EWMA (available earliest, most reactive)
-        
+
         Falls back through the chain if earlier options lack data.
+        Uses asset-specific vol floor (BTC 30%, ETH 40%, SOL 50%) instead
+        of a blanket 1% floor to avoid artificially cheap fair values.
         """
+        # Use asset-specific vol floor instead of hardcoded 1%
+        # Import here to avoid circular dependency since MIN_VOL_FLOOR
+        # is defined later in the file; fall back to 0.10 if not yet defined
+        try:
+            vol_floor = MIN_VOL_FLOOR.get(asset.upper(), 0.10)
+        except NameError:
+            vol_floor = 0.10
+
         vol = self.get_realized_vol(asset, 15)
-        if vol and vol > 0.01:  # Sanity: >1% annualized
+        if vol and vol > vol_floor:
             return vol
-        
+
         vol = self.get_realized_vol(asset, 5)
-        if vol and vol > 0.01:
+        if vol and vol > vol_floor:
             return vol
-        
+
         vol = self.get_ewma_vol(asset, "fast")
-        if vol and vol > 0.01:
+        if vol and vol > vol_floor:
             return vol
-        
+
         return None
     
     def get_status(self) -> dict:

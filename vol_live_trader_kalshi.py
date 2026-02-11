@@ -99,14 +99,44 @@ CONFIRM_SCANS = 1           # Execute on first sighting
 CRYPTOS = ["BTC", "ETH", "SOL"]
 
 def get_min_edge(seconds_left: float, direction: str = "up", market_price: float = 0) -> float:
-    """Flat 20% minimum edge for all trades.
-    
-    Derived from data: model overestimates by ~15% ROI on average,
-    plus ~5-6% for Kalshi fees. Payout asymmetry naturally favors
-    cheap contracts (one win at 25¢ covers 3 losses) while making
-    expensive contracts nearly impossible to profit on.
+    """Direction-aware minimum edge.
+
+    Base: flat 20% (model overestimates ~15% + ~5% Kalshi fees).
+
+    UP PENALTY: Data consistently shows UP trades lose money across
+    all assets (ETH UP: -$22, SOL UP: -$10, BTC UP: -$20).
+    The model systematically overprices calls vs puts, likely due to
+    IV skew effects not captured in Black-Scholes.
+    Add 8% penalty for UP trades to compensate.
+
+    TIME-OF-DAY: Night hours (22:00-04:00 UTC) have negative expectancy
+    across all directions. Add 5% penalty during these hours.
     """
-    return MIN_EDGE_PCT
+    base = MIN_EDGE_PCT
+
+    # Directional bias: UP trades consistently lose, require more edge
+    if direction.lower() in ("up", "yes"):
+        base += DIRECTION_PENALTIES.get("up", 0)
+    else:
+        base += DIRECTION_PENALTIES.get("down", 0)
+
+    # Time-of-day penalty: night hours have worse execution and model accuracy
+    current_hour_utc = datetime.now(timezone.utc).hour
+    if current_hour_utc in BLOCKED_HOURS_UTC:
+        base += TIME_OF_DAY_PENALTY
+
+    return base
+
+# Directional bias correction — UP trades consistently lose across all assets
+# Model overprices calls (likely IV skew not captured by Black-Scholes)
+DIRECTION_PENALTIES = {
+    "up": 8.0,     # +8% edge required for UP/YES trades
+    "down": 0.0,   # DOWN/NO trades perform at baseline
+}
+
+# Time-of-day filter — night hours (22:00-04:00 UTC) have negative expectancy
+BLOCKED_HOURS_UTC = {22, 23, 0, 1, 2, 3}
+TIME_OF_DAY_PENALTY = 5.0  # Extra % edge required during bad hours
 
 # Vol regime filters
 MAX_VOL_CEILING = 1.00
@@ -240,8 +270,6 @@ def kelly_size(fair: float, market_price: float, balance: float) -> int:
     while total_cost > available and contracts > 1:
         contracts -= 1
         total_cost = contracts * market_price + kalshi_taker_fee(contracts, market_price)
-    
-    return contracts
     
     return contracts
 
