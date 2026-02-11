@@ -114,7 +114,8 @@ SCAN_INTERVAL_SECONDS = 15      # Seconds between full market scans
 RECONCILE_INTERVAL_SECONDS = 120  # Seconds between position reconciliation checks
 SETTLEMENT_CHECK_INTERVAL = 30  # Seconds between settlement checks
 STATS_PRINT_INTERVAL = 60       # Seconds between dashboard prints
-VOL_WARMUP_MINUTES = 3          # Minutes of Chainlink data before trading
+VOL_WARMUP_SECONDS = 30         # Seconds of Chainlink data before trading
+VOL_WARMUP_MIN_TICKS = 2       # Minimum price ticks per asset before trading
 
 # ── Fee model (Kalshi taker) ────────────────────────────────────────────────
 # Taker fee: roundup(0.07 * C * P * (1 - P)), max $0.02/contract
@@ -957,10 +958,7 @@ class VolTracker:
 
     def is_warmed_up(self, asset: str) -> bool:
         """True if we have enough data for reliable vol estimates."""
-        closes = self._minute_closes.get(asset)
-        if not closes:
-            return False
-        return len(closes) >= VOL_WARMUP_MINUTES
+        return self.tick_count.get(asset, 0) >= VOL_WARMUP_MIN_TICKS
 
     def status_str(self) -> str:
         parts = []
@@ -1490,7 +1488,7 @@ class MarketScanner:
         """
         ticker = raw.get("ticker", "")
         status = raw.get("status", "")
-        if status != "open":
+        if status not in ("open", "active"):
             return self._reject(diag, "status_filtered", f"{ticker}[status={status}]")
 
         close_str = raw.get("close_time") or raw.get("expiration_time")
@@ -2589,7 +2587,7 @@ class EdgeScanner:
         logger.info("Chainlink price feed starting...")
 
         # Wait for initial vol warmup
-        logger.info(f"Waiting {VOL_WARMUP_MINUTES} minutes for vol warmup...")
+        logger.info(f"Waiting {VOL_WARMUP_SECONDS}s for vol warmup...")
         warmup_start = time.time()
         while self._running:
             all_warmed = all(
@@ -2599,17 +2597,17 @@ class EdgeScanner:
                 logger.info("Vol warmup complete for all assets")
                 break
             elapsed = time.time() - warmup_start
-            if elapsed > VOL_WARMUP_MINUTES * 60 * 3:  # 3x timeout
+            if elapsed > VOL_WARMUP_SECONDS * 3:  # 3x timeout
                 logger.warning("Vol warmup timeout — proceeding with available data")
                 break
             # Print progress
             warmed = sum(1 for a in CHAINLINK_SYMBOLS if self.vol_tracker.is_warmed_up(a))
-            if int(elapsed) % 30 == 0:
+            if int(elapsed) % 15 == 0:
                 logger.info(
                     f"Warmup: {warmed}/{len(CHAINLINK_SYMBOLS)} assets ready | "
                     f"{self.vol_tracker.status_str()}"
                 )
-            await asyncio.sleep(5)
+            await asyncio.sleep(3)
 
         # Print enabled categories
         for cat_key, config in CATEGORY_CONFIGS.items():
