@@ -397,6 +397,7 @@ def init_db(db_path: str = DB_PATH) -> sqlite3.Connection:
             fee REAL,
             order_id TEXT,
             order_status TEXT DEFAULT 'pending',
+            close_time TEXT,
             -- Settlement
             settled INTEGER DEFAULT 0,
             settlement_result TEXT,
@@ -485,6 +486,16 @@ def init_db(db_path: str = DB_PATH) -> sqlite3.Connection:
     """)
     conn.execute("""
         CREATE INDEX IF NOT EXISTS idx_trades_ticker ON trades(ticker)
+    """)
+
+    # Migration: add close_time column to existing trades table
+    try:
+        conn.execute("ALTER TABLE trades ADD COLUMN close_time TEXT")
+    except Exception:
+        pass  # Column already exists
+
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_trades_unsettled ON trades(settled, close_time)
     """)
 
     conn.commit()
@@ -2157,6 +2168,9 @@ class EdgeScanner:
         cost = contracts * (fill_price or opp.ask_price)
         fee = kalshi_taker_fee(contracts, fill_price or opp.ask_price)
 
+        # Rejected/unfilled orders have no real position — mark as settled immediately
+        is_no_fill = order_status in ("rejected", "unfilled")
+
         try:
             self.db.execute(
                 """
@@ -2164,8 +2178,9 @@ class EdgeScanner:
                     trade_id, timestamp, category, asset, ticker, direction,
                     strike, spot_entry, seconds_left, model_vol, model_fair,
                     ask_price, fill_price, edge_pct, implied_vol, vol_regime,
-                    contracts, cost, fee, order_id, order_status, paper_trade
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    contracts, cost, fee, order_id, order_status, paper_trade,
+                    close_time, settled, settlement_result, pnl, payout
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     trade_id,
@@ -2190,6 +2205,11 @@ class EdgeScanner:
                     order_id or "",
                     order_status,
                     1 if self.paper_mode else 0,
+                    opp.close_time.isoformat() if isinstance(opp.close_time, datetime) else str(opp.close_time),
+                    1 if is_no_fill else 0,
+                    "no_fill" if is_no_fill else None,
+                    0.0,
+                    0.0,
                 ),
             )
             self.db.commit()
@@ -2240,21 +2260,21 @@ class EdgeScanner:
     # ── Settlement Monitoring ───────────────────────────────────────────────
 
     async def check_settlements(self):
-        """Check all open positions for settlement."""
-        positions = self.positions.get_all()
+        """Check all open positions for settlement (in-memory + DB fallback)."""
         now = datetime.now(timezone.utc)
+        settled_trade_ids = set()
 
+        # ── Phase 1: Check in-memory positions (fast path) ──
+        positions = self.positions.get_all()
         for pos in positions:
-            # Only check after market close time
             if now < pos.close_time + timedelta(seconds=30):
                 continue
 
             try:
                 settlement = await self.api.get_market_settlement(pos.ticker)
                 if not settlement.get("settled"):
-                    # If it's been too long, log a warning
                     age = (now - pos.close_time).total_seconds()
-                    if age > 600:  # 10 minutes past close
+                    if age > 600:
                         logger.warning(
                             f"Position {pos.trade_id} ({pos.ticker}) still unsettled "
                             f"{age:.0f}s after close"
@@ -2271,52 +2291,109 @@ class EdgeScanner:
                 payout = pos.contracts * 1.0 if won else 0.0
                 pnl = payout - pos.cost - pos.fee
 
-                # Update DB
-                self.db.execute(
-                    """
-                    UPDATE trades SET
-                        settled=1, settlement_result=?, payout=?, pnl=?,
-                        settled_at=?
-                    WHERE trade_id=?
-                    """,
-                    (result, payout, pnl, now.isoformat(), pos.trade_id),
-                )
-                self.db.commit()
+                self._settle_trade_in_db(pos.trade_id, pos.category, result, won, payout, pnl, pos.cost, now)
+                settled_trade_ids.add(pos.trade_id)
 
-                # Update category stats
-                self.cat_stats.record_settlement(
-                    pos.category, won, pnl, pos.cost, payout
-                )
-
-                # Check circuit breaker
-                disable_reason = self.cat_stats.check_circuit_breaker(pos.category)
-                if disable_reason and pos.category not in self._disabled_categories:
-                    self._disabled_categories.add(pos.category)
-                    CATEGORY_CONFIGS[pos.category].enabled = False
-                    logger.warning(
-                        f"CIRCUIT BREAKER: Disabled category '{pos.category}': {disable_reason}"
-                    )
-                    self.db.execute(
-                        """
-                        UPDATE category_stats SET disabled_at=?, disable_reason=?
-                        WHERE category=?
-                        """,
-                        (now.isoformat(), disable_reason, pos.category),
-                    )
-                    self.db.commit()
-
-                # Log settlement
                 logger.info(
                     f"SETTLE {pos.ticker} | {'WIN' if won else 'LOSS'} | "
                     f"result={result} | payout=${payout:.2f} cost=${pos.cost:.2f} "
                     f"fee=${pos.fee:.2f} | P&L=${pnl:+.2f}"
                 )
-
-                # Remove from tracker
                 self.positions.remove(pos.trade_id)
 
             except Exception as e:
-                logger.debug(f"Settlement check error for {pos.ticker}: {e}")
+                logger.warning(f"Settlement check error for {pos.ticker}: {e}")
+
+        # ── Phase 2: DB fallback — catch orphaned trades ──
+        try:
+            cutoff = (now - timedelta(seconds=30)).isoformat()
+            rows = self.db.execute(
+                """
+                SELECT trade_id, ticker, category, direction, contracts, cost, fee, close_time
+                FROM trades
+                WHERE settled=0
+                  AND order_status IN ('filled', 'paper_filled')
+                  AND close_time IS NOT NULL
+                  AND close_time < ?
+                ORDER BY close_time ASC
+                LIMIT 50
+                """,
+                (cutoff,),
+            ).fetchall()
+        except Exception as e:
+            logger.warning(f"DB settlement query error: {e}")
+            rows = []
+
+        for row in rows:
+            trade_id, ticker, category, direction, contracts, cost, fee, close_time_str = row
+            if trade_id in settled_trade_ids:
+                continue  # Already settled in phase 1
+
+            try:
+                settlement = await self.api.get_market_settlement(ticker)
+                if not settlement.get("settled"):
+                    # Check if it's been too long
+                    try:
+                        ct = datetime.fromisoformat(close_time_str.replace("Z", "+00:00"))
+                        age = (now - ct).total_seconds()
+                        if age > 600:
+                            logger.warning(
+                                f"DB trade {trade_id} ({ticker}) still unsettled {age:.0f}s after close"
+                            )
+                    except Exception:
+                        pass
+                    continue
+
+                result = settlement.get("result", "")
+                side = "yes" if direction == "up" else "no"
+                won = (side == "yes" and result == "yes") or (side == "no" and result == "no")
+
+                payout = contracts * 1.0 if won else 0.0
+                pnl = payout - (cost or 0) - (fee or 0)
+
+                self._settle_trade_in_db(trade_id, category, result, won, payout, pnl, cost or 0, now)
+
+                logger.info(
+                    f"SETTLE (DB) {ticker} | {'WIN' if won else 'LOSS'} | "
+                    f"result={result} | payout=${payout:.2f} cost=${cost or 0:.2f} "
+                    f"fee=${fee or 0:.2f} | P&L=${pnl:+.2f}"
+                )
+
+                # Remove from in-memory tracker if present
+                self.positions.remove(trade_id)
+
+            except Exception as e:
+                logger.warning(f"DB settlement error for {ticker}: {e}")
+
+    def _settle_trade_in_db(
+        self, trade_id: str, category: str, result: str,
+        won: bool, payout: float, pnl: float, cost: float, now: datetime
+    ):
+        """Settle a trade: update DB + category stats + circuit breaker."""
+        self.db.execute(
+            """
+            UPDATE trades SET
+                settled=1, settlement_result=?, payout=?, pnl=?, settled_at=?
+            WHERE trade_id=?
+            """,
+            (result, payout, pnl, now.isoformat(), trade_id),
+        )
+        self.db.commit()
+
+        self.cat_stats.record_settlement(category, won, pnl, cost, payout)
+
+        disable_reason = self.cat_stats.check_circuit_breaker(category)
+        if disable_reason and category not in self._disabled_categories:
+            self._disabled_categories.add(category)
+            CATEGORY_CONFIGS[category].enabled = False
+            logger.warning(
+                f"CIRCUIT BREAKER: Disabled category '{category}': {disable_reason}"
+            )
+            self.db.execute(
+                "UPDATE category_stats SET disabled_at=?, disable_reason=? WHERE category=?",
+                (now.isoformat(), disable_reason, category),
+            )
+            self.db.commit()
 
     # ── Shadow Settlement ─────────────────────────────────────────────────
 
