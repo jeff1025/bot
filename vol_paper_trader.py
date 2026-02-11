@@ -319,6 +319,16 @@ class VolTracker:
         }
         self._current_minute: dict[str, int] = {asset: 0 for asset in SYMBOLS}
         self._current_minute_last_price: dict[str, float] = {}
+
+        # Per-asset minute high/low for Parkinson estimator
+        self._minute_highs: dict[str, deque] = {
+            asset: deque(maxlen=max_history_minutes) for asset in SYMBOLS
+        }
+        self._minute_lows: dict[str, deque] = {
+            asset: deque(maxlen=max_history_minutes) for asset in SYMBOLS
+        }
+        self._current_minute_high: dict[str, float] = {}
+        self._current_minute_low: dict[str, float] = {}
         
         # EWMA state per asset
         self._ewma_fast: dict[str, float] = {}  # σ² (variance), fast
@@ -429,21 +439,29 @@ class VolTracker:
         # Update minute candle
         current_min = int(ts // 60)
         if self._current_minute[asset] != current_min:
-            # New minute — close previous candle
+            # New minute — close previous candle and save high/low
             if self._current_minute_last_price.get(asset) is not None:
                 self._minute_closes[asset].append(
                     PriceTick(self._current_minute[asset] * 60, self._current_minute_last_price[asset])
                 )
+                if asset in self._current_minute_high:
+                    self._minute_highs[asset].append(self._current_minute_high[asset])
+                    self._minute_lows[asset].append(self._current_minute_low[asset])
             self._current_minute[asset] = current_min
+            self._current_minute_high[asset] = price
+            self._current_minute_low[asset] = price
+        else:
+            self._current_minute_high[asset] = max(self._current_minute_high.get(asset, price), price)
+            self._current_minute_low[asset] = min(self._current_minute_low.get(asset, price), price)
         self._current_minute_last_price[asset] = price
-        
+
         # Update EWMA with log return
         if prev_price and prev_price > 0:
             log_return = math.log(price / prev_price)
             self._last_log_return[asset] = log_return
-            
+
             r_sq = log_return ** 2
-            
+
             if not self._ewma_initialized.get(asset):
                 # Bootstrap: use first squared return as initial variance
                 self._ewma_fast[asset] = r_sq
@@ -490,9 +508,17 @@ class VolTracker:
                 self._minute_closes[asset].append(
                     PriceTick(self._current_minute[asset] * 60, self._current_minute_last_price[asset])
                 )
+                if asset in self._current_minute_high:
+                    self._minute_highs[asset].append(self._current_minute_high[asset])
+                    self._minute_lows[asset].append(self._current_minute_low[asset])
             self._current_minute[asset] = current_min
+            self._current_minute_high[asset] = price
+            self._current_minute_low[asset] = price
+        else:
+            self._current_minute_high[asset] = max(self._current_minute_high.get(asset, price), price)
+            self._current_minute_low[asset] = min(self._current_minute_low.get(asset, price), price)
         self._current_minute_last_price[asset] = price
-        
+
         # EWMA
         if prev_price and prev_price > 0:
             log_return = math.log(price / prev_price)
@@ -540,7 +566,46 @@ class VolTracker:
         annualized = std_per_minute * math.sqrt(MINUTES_PER_YEAR)
         
         return annualized
-    
+
+    def get_parkinson_vol(self, asset: str, window_minutes: int = 15) -> Optional[float]:
+        """
+        Parkinson volatility estimator using minute high-low ranges.
+
+        ~5x more statistically efficient than close-to-close estimator
+        because it uses intra-candle range information.
+
+        σ² = (1 / 4N ln2) × Σ [ln(H_i/L_i)]²
+        """
+        highs = self._minute_highs.get(asset)
+        lows = self._minute_lows.get(asset)
+        if not highs or not lows:
+            return None
+
+        n = min(len(highs), len(lows), window_minutes)
+        if n < 3:
+            return None
+
+        recent_highs = list(highs)[-n:]
+        recent_lows = list(lows)[-n:]
+
+        sum_sq = 0.0
+        valid = 0
+        for h, l in zip(recent_highs, recent_lows):
+            if h > 0 and l > 0 and h >= l:
+                log_range = math.log(h / l)
+                sum_sq += log_range ** 2
+                valid += 1
+
+        if valid < 3:
+            return None
+
+        parkinson_var = sum_sq / (4.0 * valid * math.log(2))
+        std_per_minute = math.sqrt(parkinson_var)
+
+        # Annualize
+        annualized = std_per_minute * math.sqrt(MINUTES_PER_YEAR)
+        return annualized
+
     def get_ewma_vol(self, asset: str, speed: str = "fast") -> Optional[float]:
         """
         Get EWMA-based annualized volatility.
@@ -619,28 +684,89 @@ class VolTracker:
     def get_best_vol(self, asset: str) -> Optional[float]:
         """
         Return the best available vol estimate for pricing.
-        
+
         Priority:
-        1. 15-min rolling window (most stable for 15-min binary pricing)
-        2. 5-min rolling window (less data but still window-appropriate)
-        3. Fast EWMA (available earliest, most reactive)
-        
+        1. 15-min Parkinson (most efficient estimator, uses range data)
+        2. 15-min close-to-close rolling (fallback if no high/low data)
+        3. 5-min Parkinson
+        4. 5-min close-to-close rolling
+        5. Fast EWMA (available earliest, most reactive)
+
         Falls back through the chain if earlier options lack data.
         """
-        vol = self.get_realized_vol(asset, 15)
-        if vol and vol > 0.01:  # Sanity: >1% annualized
+        vol = self.get_parkinson_vol(asset, 15)
+        if vol and vol > 0.01:
             return vol
-        
+
+        vol = self.get_realized_vol(asset, 15)
+        if vol and vol > 0.01:
+            return vol
+
+        vol = self.get_parkinson_vol(asset, 5)
+        if vol and vol > 0.01:
+            return vol
+
         vol = self.get_realized_vol(asset, 5)
         if vol and vol > 0.01:
             return vol
-        
+
         vol = self.get_ewma_vol(asset, "fast")
         if vol and vol > 0.01:
             return vol
-        
+
         return None
-    
+
+    # Drift dampening factor: 0.0 = ignore momentum, 1.0 = full momentum
+    # 0.3 is conservative — captures strong trends without overreacting to noise
+    DRIFT_DAMPENER = 0.3
+
+    def get_short_term_drift(self, asset: str, lookback_seconds: float = 300) -> float:
+        """
+        Compute annualized drift from recent price movement.
+
+        Looks at the last `lookback_seconds` of Chainlink ticks to estimate
+        a short-term drift rate. Dampened by DRIFT_DAMPENER to avoid
+        overreacting to noise.
+
+        Returns annualized drift (can be positive or negative), or 0.0
+        if insufficient data.
+        """
+        ticks = self._prices.get(asset)
+        if not ticks or len(ticks) < 2:
+            return 0.0
+
+        now_ts = ticks[-1].timestamp
+        cutoff = now_ts - lookback_seconds
+
+        # Find price at lookback point
+        start_price = None
+        for tick in ticks:
+            if tick.timestamp >= cutoff:
+                start_price = tick.price
+                break
+
+        if not start_price or start_price <= 0:
+            return 0.0
+
+        end_price = ticks[-1].price
+        if end_price <= 0:
+            return 0.0
+
+        actual_dt = now_ts - cutoff
+        if actual_dt < 30:  # Need at least 30 seconds of data
+            return 0.0
+
+        # Annualized log return
+        log_return = math.log(end_price / start_price)
+        T_years = actual_dt / SECONDS_PER_YEAR
+        if T_years <= 0:
+            return 0.0
+
+        annualized_drift = log_return / T_years
+
+        # Dampened drift — conservative to avoid overfitting
+        return annualized_drift * self.DRIFT_DAMPENER
+
     def get_status(self) -> dict:
         """Return tracker status for display"""
         status = {
@@ -695,58 +821,63 @@ class BinaryPricer:
     """
     
     @staticmethod
-    def price_binary_call(S: float, K: float, T_years: float, sigma: float) -> float:
+    def price_binary_call(S: float, K: float, T_years: float, sigma: float,
+                          mu: float = 0.0) -> float:
         """
         Fair value of binary call: pays $1 if S > K at expiry.
         Equivalent to PM "UP" or K "YES" (for "above" markets).
-        
+
+        Args:
+            mu: annualized drift rate (dampened short-term momentum).
+                Positive = price trending up, negative = trending down.
+
         Returns: probability (0.0 to 1.0) = fair price in dollars
         """
         if T_years <= 0:
-            # At expiry: worth $1 if S > K, else $0
             return 1.0 if S > K else 0.0
-        
+
         if sigma <= 0:
-            # Zero vol: deterministic
             return 1.0 if S > K else 0.0
-        
+
         if S <= 0 or K <= 0:
             return 0.0
-        
+
         sqrt_T = math.sqrt(T_years)
-        d2 = (math.log(S / K) + (-0.5 * sigma ** 2) * T_years) / (sigma * sqrt_T)
-        
+        d2 = (math.log(S / K) + (mu - 0.5 * sigma ** 2) * T_years) / (sigma * sqrt_T)
+
         return _norm_cdf(d2)
-    
+
     @staticmethod
-    def price_binary_put(S: float, K: float, T_years: float, sigma: float) -> float:
+    def price_binary_put(S: float, K: float, T_years: float, sigma: float,
+                         mu: float = 0.0) -> float:
         """
         Fair value of binary put: pays $1 if S < K at expiry.
         Equivalent to PM "DOWN" or K "NO" (for "above" markets).
         """
-        return 1.0 - BinaryPricer.price_binary_call(S, K, T_years, sigma)
-    
+        return 1.0 - BinaryPricer.price_binary_call(S, K, T_years, sigma, mu)
+
     @staticmethod
     def fair_value(S: float, K: float, seconds_left: float, sigma: float,
-                   direction: str = "up") -> float:
+                   direction: str = "up", mu: float = 0.0) -> float:
         """
         Convenience method: price a binary option.
-        
+
         Args:
             S: current underlying price (e.g. 65000 for BTC)
             K: strike price
             seconds_left: seconds until market settles
             sigma: annualized volatility
             direction: "up" (pays if S>K) or "down" (pays if S<K)
-            
+            mu: annualized drift (from short-term momentum)
+
         Returns: fair price 0.00-1.00
         """
         T = seconds_left / SECONDS_PER_YEAR
-        
+
         if direction in ("up", "yes", "call"):
-            return BinaryPricer.price_binary_call(S, K, T, sigma)
+            return BinaryPricer.price_binary_call(S, K, T, sigma, mu)
         else:
-            return BinaryPricer.price_binary_put(S, K, T, sigma)
+            return BinaryPricer.price_binary_put(S, K, T, sigma, mu)
     
     @staticmethod
     def implied_vol(market_price: float, S: float, K: float, seconds_left: float,
@@ -808,7 +939,12 @@ class BinaryPricer:
                 else:
                     lo = mid
         
-        return (lo + hi) / 2  # Best estimate after max iterations
+        # Check if bisection converged to a reasonable answer
+        best = (lo + hi) / 2
+        model_price = BinaryPricer.fair_value(S, K, seconds_left, best, direction)
+        if abs(model_price - market_price) > 0.01:
+            return None  # Did not converge — unreliable
+        return best
 
 
 # =============================================================================
@@ -1373,8 +1509,173 @@ async def check_kalshi_resolution(kalshi_reader, ticker: str, our_direction: str
         return None
 
 # Trading parameters
-MIN_EDGE_PCT = 2.0          # Minimum edge % to trigger paper trade
+MIN_EDGE_PCT = 3.0          # Base minimum edge % (adaptive — see get_adaptive_edge_threshold)
 MAX_EDGE_PCT = 40.0         # Above this, assume stale data / model error
+
+
+def get_adaptive_edge_threshold(asset: str, seconds_left: float,
+                                vol_tracker, base: float = 3.0) -> float:
+    """
+    Adaptive edge threshold based on data quality and vol confidence.
+
+    Trades more aggressively when data is strong, conservatively when uncertain.
+    Returns minimum edge % required for this specific trade setup.
+    """
+    threshold = base
+
+    # 1. Data quality: more candles = more confidence = lower threshold
+    minutes = len(vol_tracker._minute_closes.get(asset, []))
+    if minutes < 10:
+        threshold += 4.0   # Not enough data, require more edge
+    elif minutes >= 30:
+        threshold -= 1.5   # Good data, can be more aggressive
+
+    # 2. Vol agreement: if Parkinson and EWMA agree, lower threshold
+    parkinson = vol_tracker.get_parkinson_vol(asset)
+    ewma = vol_tracker.get_ewma_vol(asset, "fast")
+    if parkinson and ewma and ewma > 0:
+        ratio = parkinson / ewma
+        if 0.8 <= ratio <= 1.2:
+            threshold -= 1.5   # Strong agreement between estimators
+        elif ratio > 2.0 or ratio < 0.5:
+            threshold += 4.0   # Major disagreement — don't trust
+
+    # 3. Time-to-expiry: less time = more binary = higher threshold
+    if seconds_left < 300:
+        threshold += 2.0   # Last 5 min is more binary
+    elif seconds_left > 600:
+        threshold -= 1.0   # More time for model to be right
+
+    return max(2.0, min(threshold, 25.0))
+
+
+# =============================================================================
+# CalibrationTracker — Online model calibration from historical outcomes
+# =============================================================================
+
+CALIBRATION_FILE = os.path.join(
+    os.path.expanduser("~"), ".arb_data", "calibration.json"
+)
+
+
+class CalibrationTracker:
+    """
+    Tracks model fair value predictions vs actual outcomes to compute
+    a running calibration correction factor.
+
+    Bins trades by model_fair into 10 buckets (0-0.1, 0.1-0.2, ..., 0.9-1.0).
+    After enough trades per bin (MIN_SAMPLES), the correction factor is:
+        correction = empirical_win_rate / bin_center
+
+    Apply: corrected_fair = fair * get_correction(fair)
+    """
+
+    MIN_SAMPLES = 10  # Minimum trades per bin before correction is active
+
+    def __init__(self):
+        # 10 bins: keyed by lower bound (0.0, 0.1, ..., 0.9)
+        self.bins: dict[str, dict] = {}
+        for i in range(10):
+            key = f"{i / 10:.1f}"
+            self.bins[key] = {"count": 0, "wins": 0}
+        self._load()
+
+    def _bin_key(self, model_fair: float) -> str:
+        """Map a fair value to its bin key."""
+        idx = max(0, min(9, int(model_fair * 10)))
+        return f"{idx / 10:.1f}"
+
+    def record(self, model_fair: float, won: bool):
+        """Record a trade outcome for calibration."""
+        key = self._bin_key(model_fair)
+        self.bins[key]["count"] += 1
+        if won:
+            self.bins[key]["wins"] += 1
+
+    def get_correction(self, model_fair: float) -> float:
+        """
+        Get calibration correction factor for a given model fair value.
+
+        Returns 1.0 (no correction) if insufficient data in this bin.
+        Otherwise returns empirical_win_rate / bin_center.
+        """
+        key = self._bin_key(model_fair)
+        data = self.bins[key]
+        if data["count"] < self.MIN_SAMPLES:
+            return 1.0
+
+        empirical = data["wins"] / data["count"]
+        # Bin center: e.g. key "0.3" → center = 0.35
+        bin_center = float(key) + 0.05
+        if bin_center < 0.01:
+            return 1.0
+
+        correction = empirical / bin_center
+        # Clamp to reasonable range to avoid wild swings
+        return max(0.5, min(correction, 1.5))
+
+    def save(self):
+        """Persist calibration data to disk."""
+        try:
+            os.makedirs(os.path.dirname(CALIBRATION_FILE), exist_ok=True)
+            with open(CALIBRATION_FILE, "w") as f:
+                json.dump(self.bins, f, indent=2)
+        except Exception:
+            pass
+
+    def _load(self):
+        """Load calibration data from disk."""
+        try:
+            if os.path.exists(CALIBRATION_FILE):
+                with open(CALIBRATION_FILE, "r") as f:
+                    saved = json.load(f)
+                for key, data in saved.items():
+                    if key in self.bins:
+                        self.bins[key] = data
+        except Exception:
+            pass
+
+    def bootstrap_from_journal(self, journal_path: str):
+        """Bootstrap calibration from existing trade journal (JSONL)."""
+        if not os.path.exists(journal_path):
+            return
+        loaded = 0
+        try:
+            with open(journal_path, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if entry.get("event") != "SETTLE":
+                        continue
+                    model_fair = entry.get("model_fair")
+                    won = entry.get("won")
+                    if model_fair is not None and won is not None:
+                        self.record(float(model_fair), bool(won))
+                        loaded += 1
+            if loaded > 0:
+                self.save()
+                print(f"[Calibration] Bootstrapped from {loaded} settled trades")
+        except Exception as e:
+            print(f"[Calibration] Bootstrap error: {e}")
+
+    def summary(self) -> str:
+        """Human-readable calibration summary."""
+        parts = []
+        for i in range(10):
+            key = f"{i / 10:.1f}"
+            d = self.bins[key]
+            if d["count"] > 0:
+                wr = d["wins"] / d["count"] * 100
+                corr = self.get_correction(float(key) + 0.05)
+                parts.append(f"{key}:{d['count']}t/{wr:.0f}%WR/×{corr:.2f}")
+        return " | ".join(parts) if parts else "no data"
+
+
 MIN_SECONDS_LEFT = 120      # Don't trade with < 2 min remaining
 MAX_SECONDS_LEFT = 840      # Don't trade with > 14 min remaining (too early)
 SLIPPAGE_CENTS = 3.0        # Assume 3¢ worse fill than displayed price
@@ -1997,39 +2298,36 @@ async def fetch_kalshi_vol_markets(kalshi: KalshiReader) -> list:
 def get_adaptive_vol(model: VolModel, asset: str, seconds_left: float) -> Optional[float]:
     """
     Select the best vol estimate based on time remaining in contract.
-    
-    >10 min: 15m rolling window (most stable)
-    5-10 min: blend 5m (60%) and 15m (40%)
-    2-5 min: 5m rolling window (recency matters)
-    <2 min: fast EWMA (most reactive)
-    
-    If vol regime is "expanding", lean toward shorter window.
+
+    Prefers Parkinson (high-low range) over close-to-close when available.
+    Smooth time-based blending instead of hard cutoffs.
+
     Final result is scaled by VOL_DAMPENER to correct systematic overestimation.
     """
     tracker = model.vol_tracker
     regime = tracker.get_vol_regime(asset)
     expanding = regime and regime["ratio"] > 1.5
-    
-    vol_5m = tracker.get_realized_vol(asset, 5)
-    vol_15m = tracker.get_realized_vol(asset, 15)
+
+    # Prefer Parkinson estimator, fall back to close-to-close
+    vol_5m = tracker.get_parkinson_vol(asset, 5) or tracker.get_realized_vol(asset, 5)
+    vol_15m = tracker.get_parkinson_vol(asset, 15) or tracker.get_realized_vol(asset, 15)
     ewma_fast = tracker.get_ewma_vol(asset, "fast")
-    
+
     raw_vol = None
-    
+
     if seconds_left > 600:  # >10 min
         if expanding and vol_5m:
-            # Vol spiking — blend in shorter window
             base = vol_15m or vol_5m
             raw_vol = 0.6 * vol_5m + 0.4 * base if vol_5m and base else vol_5m or base
         else:
             raw_vol = vol_15m or vol_5m or ewma_fast
-    
+
     elif seconds_left > 300:  # 5-10 min
         if vol_5m and vol_15m:
             raw_vol = 0.6 * vol_5m + 0.4 * vol_15m
         else:
             raw_vol = vol_5m or vol_15m or ewma_fast
-    
+
     elif seconds_left > 120:  # 2-5 min
         raw_vol = vol_5m or ewma_fast or vol_15m
     
@@ -2067,7 +2365,8 @@ class PaperTrade:
     # Vol context
     vol_regime: str
     implied_vol: Optional[float]
-    
+    drift: float = 0.0      # Annualized drift (dampened momentum)
+
     # Trade
     size: int
     cost: float             # fill_price * size
@@ -2427,9 +2726,13 @@ class PaperTrader:
             trade.settled = True
             trade.settle_time = now.strftime("%Y-%m-%dT%H:%M:%SZ")
             trade.won = won
-            
+
             trade.payout = trade.size * 1.0 if trade.won else 0
             trade.pnl = round(trade.payout - trade.cost, 4)
+
+            # Record outcome for calibration tracking
+            if hasattr(self, '_calibration') and self._calibration:
+                self._calibration.record(trade.model_fair, bool(trade.won))
             
             # Update simulated balance (cost already deducted at open)
             self.sim_balance += trade.payout
@@ -2621,6 +2924,12 @@ async def run_simulator():
     
     trader = PaperTrader()
     pricer = BinaryPricer()
+
+    # Calibration tracker — bootstraps from existing trade journal
+    calibration = CalibrationTracker()
+    calibration.bootstrap_from_journal(SIM_TRADES_FILE)
+    trader._calibration = calibration  # Wire up for settlement recording
+    print(f"  [Calibration] {calibration.summary()}")
     
     if httpx is None:
         print("ERROR: httpx not installed. Run: pip install httpx")
@@ -2711,6 +3020,7 @@ async def run_simulator():
                     
                     trader.save_summary()
                     model.save_state()  # Persist vol for fast restarts
+                    calibration.save()  # Persist calibration data
                 
                 # Need vol data to trade
                 has_vol = any(model.get_vol(a) for a in ["BTC", "ETH", "SOL"])
@@ -2832,27 +3142,41 @@ async def run_simulator():
                     # Determine what to evaluate
                     # For an "up" market: YES = pays if above strike, NO = pays if below
                     # For a "down" market: YES = pays if below, NO = pays if above
-                    
+
+                    # Get short-term momentum drift for this asset
+                    drift = model.vol_tracker.get_short_term_drift(mkt.underlying)
+
                     evaluations = []
-                    
+
                     if mkt.direction == "up":
                         if yes_ask > 0.01:
-                            fair = pricer.fair_value(spot, mkt.strike_price, seconds_left, vol, "up")
+                            fair = pricer.fair_value(spot, mkt.strike_price, seconds_left, vol, "up", drift)
                             evaluations.append(("up", yes_ask, yes_size, fair))
                         if no_ask > 0.01:
-                            fair = pricer.fair_value(spot, mkt.strike_price, seconds_left, vol, "down")
+                            fair = pricer.fair_value(spot, mkt.strike_price, seconds_left, vol, "down", drift)
                             evaluations.append(("down", no_ask, no_size, fair))
                     else:
                         if yes_ask > 0.01:
-                            fair = pricer.fair_value(spot, mkt.strike_price, seconds_left, vol, "down")
+                            fair = pricer.fair_value(spot, mkt.strike_price, seconds_left, vol, "down", drift)
                             evaluations.append(("down", yes_ask, yes_size, fair))
                         if no_ask > 0.01:
-                            fair = pricer.fair_value(spot, mkt.strike_price, seconds_left, vol, "up")
+                            fair = pricer.fair_value(spot, mkt.strike_price, seconds_left, vol, "up", drift)
                             evaluations.append(("up", no_ask, no_size, fair))
                     
                     for direction, market_price, depth, fair in evaluations:
                         evaluated += 1
-                        
+
+                        # Filter: skip when model vol is much hotter than market IV
+                        # Data shows model_vol > IV → 36% WR, model_vol < IV → 56% WR
+                        iv_check = pricer.implied_vol(market_price, spot, mkt.strike_price, seconds_left, direction)
+                        if iv_check and 0.01 < iv_check < 3.0:
+                            vol_iv_ratio = vol / iv_check
+                            if vol_iv_ratio > 1.5:
+                                continue  # Model overestimates — skip
+
+                        # Apply calibration correction to fair value
+                        fair = fair * calibration.get_correction(fair)
+
                         # Edge check
                         effective_price = market_price + (SLIPPAGE_CENTS / 100)
                         effective_edge_pct = ((fair - effective_price) / effective_price) * 100 if effective_price > 0 else 0
@@ -2862,7 +3186,8 @@ async def run_simulator():
                             best_edge_seen = effective_edge_pct
                             best_edge_label = f"{mkt.underlying} {direction.upper()} fair={fair:.3f} mkt={market_price:.3f} K={mkt.strike_price:,.0f} spot={spot:,.2f} σ={vol*100:.0f}% {seconds_left:.0f}s depth={depth:.0f}"
                         
-                        if effective_edge_pct < MIN_EDGE_PCT:
+                        adaptive_min = get_adaptive_edge_threshold(mkt.underlying, seconds_left, model.vol_tracker)
+                        if effective_edge_pct < adaptive_min:
                             continue
                         if effective_edge_pct > MAX_EDGE_PCT:
                             continue  # Suspiciously large — probably model error
@@ -2891,6 +3216,7 @@ async def run_simulator():
                                 "spot": spot,
                                 "seconds_left": seconds_left,
                                 "vol": vol,
+                                "drift": drift,
                                 "fair": fair,
                                 "market_price": market_price,
                                 "iv": iv or 0,

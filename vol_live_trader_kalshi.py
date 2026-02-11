@@ -63,6 +63,7 @@ try:
         VolModel, BinaryPricer,
         get_adaptive_vol,
         MIN_VOL_FLOOR,
+        CalibrationTracker,
     )
 except ImportError:
     print("[ERROR] vol_paper_trader.py not found in same folder!")
@@ -98,15 +99,42 @@ ORDER_TIMEOUT_SEC = 30      # Cancel unfilled orders after this
 CONFIRM_SCANS = 1           # Execute on first sighting
 CRYPTOS = ["BTC", "ETH", "SOL"]
 
-def get_min_edge(seconds_left: float, direction: str = "up", market_price: float = 0) -> float:
-    """Flat 20% minimum edge for all trades.
-    
-    Derived from data: model overestimates by ~15% ROI on average,
-    plus ~5-6% for Kalshi fees. Payout asymmetry naturally favors
-    cheap contracts (one win at 25¢ covers 3 losses) while making
-    expensive contracts nearly impossible to profit on.
+def get_min_edge(seconds_left: float, direction: str = "up", market_price: float = 0,
+                 asset: str = "", vol_tracker=None) -> float:
+    """Adaptive minimum edge based on data quality and vol confidence.
+
+    Base: 8% (down from 20% now that model improvements reduce overestimation).
+    Adjusts up/down based on vol agreement, data quality, and time left.
     """
-    return MIN_EDGE_PCT
+    if not vol_tracker or not asset:
+        return MIN_EDGE_PCT  # Fallback to static if no tracker
+
+    base = 8.0
+
+    # Data quality
+    minutes = len(vol_tracker._minute_closes.get(asset, []))
+    if minutes < 10:
+        base += 5.0
+    elif minutes >= 30:
+        base -= 2.0
+
+    # Vol agreement: Parkinson vs EWMA
+    parkinson = vol_tracker.get_parkinson_vol(asset)
+    ewma = vol_tracker.get_ewma_vol(asset, "fast")
+    if parkinson and ewma and ewma > 0:
+        ratio = parkinson / ewma
+        if 0.8 <= ratio <= 1.2:
+            base -= 2.0
+        elif ratio > 2.0 or ratio < 0.5:
+            base += 5.0
+
+    # Time-to-expiry
+    if seconds_left < 300:
+        base += 3.0
+    elif seconds_left > 600:
+        base -= 1.0
+
+    return max(5.0, min(base, 25.0))
 
 # Vol regime filters
 MAX_VOL_CEILING = 1.00
@@ -269,9 +297,11 @@ def compute_blended_vol(model_vol: float, market_price: float, spot: float,
     - If IV can't be computed: returns model vol unchanged
     """
     iv = pricer.implied_vol(market_price, spot, strike, seconds_left, direction)
-    
-    if not iv or iv <= 0.01:
-        return model_vol, None, "no_iv_fallback"
+
+    if not iv or iv <= 0.01 or iv > 3.0:
+        # IV unreliable — apply conservative 15% haircut instead of passing through
+        dampened = model_vol * 0.85
+        return dampened, None, "no_iv_dampened(0.85x)"
     
     ratio = model_vol / iv
     
@@ -1127,7 +1157,11 @@ class LiveTrader:
             
             trade.settled = True
             trade.won = won
-            
+
+            # Record outcome for calibration tracking
+            if hasattr(self, '_calibration') and self._calibration:
+                self._calibration.record(trade.model_fair, bool(trade.won))
+
             if trade.won:
                 trade.payout = round(1.0 * trade.fill_size, 2)
             else:
@@ -1299,6 +1333,12 @@ async def run_live_trader():
     # Init trader and pricer
     trader = LiveTrader()
     pricer = BinaryPricer()
+
+    # Calibration tracker — bootstraps from existing trade journal
+    calibration = CalibrationTracker()
+    calibration.bootstrap_from_journal(LIVE_JOURNAL_FILE)
+    trader._calibration = calibration
+    print(f"  [Calibration] {calibration.summary()}")
     
     # Start input listener thread
     input_thread = threading.Thread(target=_input_listener, daemon=True)
@@ -1439,22 +1479,38 @@ async def run_live_trader():
                     if yes_ask <= 0.01 and no_ask <= 0.01:
                         continue
                     
-                    # Evaluate both sides — using blended vol
+                    # Get short-term momentum drift for this asset
+                    drift = model.vol_tracker.get_short_term_drift(underlying)
+
+                    # Evaluate both sides — using blended vol + drift
                     evaluations = []
                     if yes_ask > 0.01:
                         b_vol, b_iv, b_info = compute_blended_vol(vol, yes_ask, spot, strike, seconds_left, "up", pricer)
-                        fair = pricer.fair_value(spot, strike, seconds_left, b_vol, "up")
+                        fair = pricer.fair_value(spot, strike, seconds_left, b_vol, "up", drift)
                         evaluations.append(("up", yes_ask, yes_size, fair, "yes", vol, b_vol, b_iv, b_info))
                     if no_ask > 0.01:
                         b_vol, b_iv, b_info = compute_blended_vol(vol, no_ask, spot, strike, seconds_left, "down", pricer)
-                        fair = pricer.fair_value(spot, strike, seconds_left, b_vol, "down")
+                        fair = pricer.fair_value(spot, strike, seconds_left, b_vol, "down", drift)
                         evaluations.append(("down", no_ask, no_size, fair, "no", vol, b_vol, b_iv, b_info))
                     
                     for direction, market_price, depth, fair, kalshi_side, raw_vol, blended_vol_val, blend_iv, blend_info in evaluations:
                         evaluated += 1
-                        
-                        effective_edge_pct = ((fair - market_price) / market_price) * 100 if market_price > 0 else 0
-                        
+
+                        # Filter: skip when model vol is much hotter than market IV
+                        # Data shows model_vol > IV → 36% WR, model_vol < IV → 56% WR
+                        if blend_iv and 0.01 < blend_iv < 3.0:
+                            vol_iv_ratio = raw_vol / blend_iv
+                            if vol_iv_ratio > 1.5:
+                                continue  # Model overestimates — skip
+
+                        # Apply calibration correction to fair value
+                        fair = fair * calibration.get_correction(fair)
+
+                        # Fee-adjusted edge: subtract per-contract fee from expected value
+                        per_contract_fee = kalshi_taker_fee(1, market_price)
+                        effective_cost = market_price + per_contract_fee
+                        effective_edge_pct = ((fair - effective_cost) / effective_cost) * 100 if effective_cost > 0 else 0
+
                         if effective_edge_pct > best_edge_seen:
                             best_edge_seen = effective_edge_pct
                             best_edge_label = (
@@ -1463,7 +1519,7 @@ async def run_live_trader():
                                 f"spot={spot:,.2f} σ={vol*100:.0f}% {seconds_left:.0f}s"
                             )
                         
-                        required_edge = get_min_edge(seconds_left, direction, market_price)
+                        required_edge = get_min_edge(seconds_left, direction, market_price, underlying, model.vol_tracker)
                         
                         regime_data = model.get_regime(underlying)
                         regime = regime_data["regime"] if regime_data else "normal"
@@ -1494,6 +1550,7 @@ async def run_live_trader():
                                 "raw_model_vol": raw_vol,
                                 "blended_vol": blended_vol_val,
                                 "blend_info": blend_info,
+                                "drift": drift,
                                 "fair": fair,
                                 "market_price": market_price,
                                 "iv": iv or 0,
@@ -1538,7 +1595,7 @@ async def run_live_trader():
                     if not can_trade:
                         break
                     
-                    req_edge = get_min_edge(c['seconds_left'], c['direction'], c['market_price'])
+                    req_edge = get_min_edge(c['seconds_left'], c['direction'], c['market_price'], c['asset'], model.vol_tracker)
                     r_mult = VOL_EDGE_MULTIPLIERS.get(c.get('regime', 'normal'), 1.2)
                     eff_req = req_edge * r_mult
                     
@@ -1625,7 +1682,8 @@ async def run_live_trader():
                 if scan_count % 4 == 0:
                     trader.save_summary()
                     model.save_state()
-                
+                    calibration.save()
+
                 await asyncio.sleep(SCAN_INTERVAL)
                 
             except KeyboardInterrupt:
