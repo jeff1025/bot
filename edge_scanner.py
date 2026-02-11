@@ -130,6 +130,11 @@ MAX_DAILY_LOSS_DOLLARS = 50.0      # Stop trading for the day if realized loss e
 MAX_TRADES_PER_HOUR = 12           # Rate limit on order placement (tightened: ~2/hr per category)
 BALANCE_RESERVE_PCT = 50           # Keep this % of balance uninvested
 
+# ── Orderbook batching ────────────────────────────────────────────────────
+MAX_ORDERBOOK_CANDIDATES = 15      # Only fetch orderbook for top N candidates by edge potential
+FAIR_VALUE_EXTREME_LOW = 0.03      # Skip markets with fair value below this (near-certain no-settle)
+FAIR_VALUE_EXTREME_HIGH = 0.97     # Skip markets with fair value above this (near-certain settle)
+
 # ── Vol model parameters ────────────────────────────────────────────────────
 MINUTES_PER_YEAR = 525_960
 SECONDS_PER_YEAR = MINUTES_PER_YEAR * 60
@@ -1463,31 +1468,43 @@ class MarketScanner:
                 logger.error(f"Category scan error: {r}")
         return all_markets
 
+    @staticmethod
+    def _reject(diag, reason, ticker):
+        """Record a parse rejection in diagnostics."""
+        if diag is not None:
+            diag[reason] = diag.get(reason, 0) + 1
+            samples = diag.setdefault("samples", {})
+            sl = samples.setdefault(reason, [])
+            if len(sl) < 3:
+                sl.append(ticker)
+        logger.debug(f"PARSE REJECT: {ticker} -> {reason}")
+        return None
+
     def parse_market(
-        self, raw: dict, now: datetime
+        self, raw: dict, now: datetime, diag: dict = None
     ) -> Optional[dict]:
         """
         Parse a raw Kalshi market dict into structured data.
         Returns dict with ticker, asset, strike, direction, close_time, seconds_left
-        or None if unparseable.
+        or None if unparseable. If diag dict is provided, records rejection reasons.
         """
         ticker = raw.get("ticker", "")
         status = raw.get("status", "")
         if status != "open":
-            return None
+            return self._reject(diag, "status_filtered", ticker)
 
         close_str = raw.get("close_time") or raw.get("expiration_time")
         if not close_str:
-            return None
+            return self._reject(diag, "no_close_time", ticker)
 
         try:
             close_time = datetime.fromisoformat(close_str.replace("Z", "+00:00"))
         except (ValueError, TypeError):
-            return None
+            return self._reject(diag, "bad_datetime", ticker)
 
         seconds_left = (close_time - now).total_seconds()
         if seconds_left <= 0:
-            return None
+            return self._reject(diag, "expired", ticker)
 
         # Extract strike and direction from ticker
         parsed = _extract_strike_from_ticker(ticker)
@@ -1497,7 +1514,7 @@ class MarketScanner:
             # Fallback: extract strike from subtitle/metadata (15-min markets)
             strike = _extract_strike_from_market_data(raw)
             if not strike:
-                return None
+                return self._reject(diag, "no_strike", ticker)
             direction = None  # Signal: both sides should be evaluated
 
         # Extract asset
@@ -1510,7 +1527,7 @@ class MarketScanner:
                     asset = a
                     break
         if not asset:
-            return None
+            return self._reject(diag, "no_asset", ticker)
 
         return {
             "ticker": ticker,
@@ -1766,6 +1783,16 @@ class EdgeScanner:
             "no_edge": 0,           # fair <= ask (no edge at all)
             "price_filtered": 0,    # ask outside price range
             "time_filtered": 0,     # expiry outside time range
+            "pre_screened": 0,      # passed pre-evaluation (fair value computed)
+            "fv_extreme_filtered": 0,  # fair value too close to 0 or 1
+            "orderbook_fetched": 0, # actually fetched orderbook
+        }
+
+        # Parse diagnostics (updated each scan, shown on dashboard)
+        self._last_parse_diag: dict = {
+            "total": 0, "status_filtered": 0, "no_close_time": 0,
+            "bad_datetime": 0, "expired": 0, "no_strike": 0,
+            "no_asset": 0, "passed": 0, "samples": {},
         }
 
     # ── Fair Value Models ───────────────────────────────────────────────────
@@ -1810,12 +1837,13 @@ class EdgeScanner:
 
     # ── Opportunity Evaluation ──────────────────────────────────────────────
 
-    async def evaluate_market(
+    def pre_evaluate_market(
         self, parsed: dict, config: CategoryConfig
-    ) -> Optional[MarketOpportunity]:
+    ) -> Optional[dict]:
         """
-        Evaluate a single parsed market for trading opportunity.
-        Returns MarketOpportunity if edge meets threshold, None otherwise.
+        Pre-evaluate a market WITHOUT fetching orderbook.
+        Computes fair value and theoretical edge potential.
+        Returns enriched dict with fair, vol, spot, edge_potential added, or None.
         """
         ticker = parsed["ticker"]
         category = parsed["category"]
@@ -1823,7 +1851,6 @@ class EdgeScanner:
         direction = parsed["direction"]
         strike = parsed["strike"]
         seconds_left = parsed["seconds_left"]
-        close_time = parsed["close_time"]
 
         diag = self._last_scan_diag
 
@@ -1840,16 +1867,52 @@ class EdgeScanner:
             return None
         if self.positions.count_by_category(category) >= config.max_positions_per_category:
             return None
-        # Event-level limit (correlated risk across strikes in same event)
         event_ticker = parsed.get("event_ticker", "")
         if event_ticker and self.positions.count_by_event(event_ticker) >= config.max_positions_per_event:
             return None
 
-        # Compute fair value
+        # Compute fair value (NO orderbook needed)
         fv_result = self.compute_fair_value(category, asset, strike, seconds_left, direction)
         if not fv_result:
             return None
         fair, vol, spot = fv_result
+
+        # Filter extreme fair values (near 0 or 1 = no edge opportunity)
+        if fair < FAIR_VALUE_EXTREME_LOW or fair > FAIR_VALUE_EXTREME_HIGH:
+            diag["fv_extreme_filtered"] += 1
+            return None
+
+        # Edge potential: markets near 0.50 have the most room for edge
+        edge_potential = min(fair, 1.0 - fair)
+
+        return {
+            **parsed,
+            "fair": fair,
+            "vol": vol,
+            "spot": spot,
+            "edge_potential": edge_potential,
+        }
+
+    async def evaluate_market_with_orderbook(
+        self, candidate: dict, config: CategoryConfig
+    ) -> Optional[MarketOpportunity]:
+        """
+        Evaluate a pre-screened market candidate by fetching its orderbook.
+        The candidate dict must contain fair, vol, spot from pre_evaluate_market().
+        Returns MarketOpportunity if edge meets threshold, None otherwise.
+        """
+        ticker = candidate["ticker"]
+        category = candidate["category"]
+        asset = candidate["asset"]
+        direction = candidate["direction"]
+        strike = candidate["strike"]
+        seconds_left = candidate["seconds_left"]
+        close_time = candidate["close_time"]
+        fair = candidate["fair"]
+        vol = candidate["vol"]
+        spot = candidate["spot"]
+
+        diag = self._last_scan_diag
 
         # Get orderbook
         ob = await self.api.get_orderbook(ticker)
@@ -1899,7 +1962,7 @@ class EdgeScanner:
 
         return MarketOpportunity(
             ticker=ticker,
-            event_ticker=parsed["event_ticker"],
+            event_ticker=candidate["event_ticker"],
             category=category,
             asset=asset,
             direction=direction,
@@ -2234,6 +2297,12 @@ class EdgeScanner:
             "raw_markets": 0, "markets_scanned": 0, "evaluated": 0, "opportunities": 0,
             "best_gross_edge": 0.0, "best_ticker": "",
             "near_misses": 0, "no_edge": 0, "price_filtered": 0, "time_filtered": 0,
+            "pre_screened": 0, "fv_extreme_filtered": 0, "orderbook_fetched": 0,
+        }
+        self._last_parse_diag = {
+            "total": 0, "status_filtered": 0, "no_close_time": 0,
+            "bad_datetime": 0, "expired": 0, "no_strike": 0,
+            "no_asset": 0, "passed": 0, "samples": {},
         }
 
         # Apply dashboard config overrides (min_edge_pct sliders)
@@ -2266,10 +2335,13 @@ class EdgeScanner:
 
         # 2. Parse and filter
         parsed_markets = []
+        pd = self._last_parse_diag
         for raw in raw_markets:
-            parsed = self.scanner.parse_market(raw, now)
+            pd["total"] += 1
+            parsed = self.scanner.parse_market(raw, now, diag=pd)
             if not parsed:
                 continue
+            pd["passed"] += 1
             if parsed["direction"] is None:
                 # 15-min market: evaluate both up (YES) and down (NO) sides
                 for d in ("up", "down"):
@@ -2279,9 +2351,20 @@ class EdgeScanner:
             else:
                 parsed_markets.append(parsed)
 
-        # 3. Evaluate each market for edge
+        # Log parse diagnostics
+        logger.info(
+            f"PARSE: {pd['total']} raw -> {pd['passed']} parsed | "
+            f"status={pd['status_filtered']} expired={pd['expired']} "
+            f"no_strike={pd['no_strike']} no_asset={pd['no_asset']} "
+            f"no_close={pd['no_close_time']} bad_dt={pd['bad_datetime']}"
+        )
+        if self.verbose:
+            for reason, tickers in pd.get("samples", {}).items():
+                logger.info(f"  PARSE REJECT [{reason}]: {', '.join(tickers)}")
+
+        # 3. Pre-evaluate: compute fair values (NO orderbook calls)
         self._last_scan_diag["markets_scanned"] = len(parsed_markets)
-        opportunities = []
+        candidates = []
         for parsed in parsed_markets:
             config = CATEGORY_CONFIGS.get(parsed["category"])
             if not config or not config.enabled:
@@ -2293,13 +2376,35 @@ class EdgeScanner:
             if not self.vol_tracker.is_warmed_up(parsed["asset"]):
                 continue
 
-            opp = await self.evaluate_market(parsed, config)
+            candidate = self.pre_evaluate_market(parsed, config)
+            if candidate:
+                candidates.append(candidate)
+
+        # 4. Sort by edge potential (highest first) and take top N
+        candidates.sort(key=lambda c: c["edge_potential"], reverse=True)
+        top_candidates = candidates[:MAX_ORDERBOOK_CANDIDATES]
+
+        self._last_scan_diag["pre_screened"] = len(candidates)
+        self._last_scan_diag["orderbook_fetched"] = len(top_candidates)
+
+        logger.info(
+            f"BATCH: {len(parsed_markets)} parsed -> {len(candidates)} pre-screened -> "
+            f"top {len(top_candidates)} for orderbook"
+        )
+
+        # 5. Fetch orderbook ONLY for top candidates
+        opportunities = []
+        for candidate in top_candidates:
+            config = CATEGORY_CONFIGS.get(candidate["category"])
+            if not config:
+                continue
+            opp = await self.evaluate_market_with_orderbook(candidate, config)
             if opp:
                 opportunities.append(opp)
 
         self._last_scan_diag["opportunities"] = len(opportunities)
 
-        # 4. Rank by net edge (best first), with near-the-money preference as tiebreaker
+        # 6. Rank by net edge (best first), with near-the-money preference as tiebreaker
         def _rank_key(opp):
             # Primary: net edge (higher is better)
             # Secondary: closeness to ATM (lower moneyness distance is better)
@@ -2311,7 +2416,7 @@ class EdgeScanner:
 
         opportunities.sort(key=_rank_key, reverse=True)
 
-        # 5. Execute (best first, within limits)
+        # 7. Execute (best first, within limits)
         trades_executed = 0
         for opp in opportunities:
             # Re-check limits before each trade
@@ -2418,13 +2523,28 @@ class EdgeScanner:
                 f"positions={cat_pos}/{config.max_positions_per_category}"
             )
 
+        # Parse diagnostics
+        pd = self._last_parse_diag
+        if pd["total"] > 0:
+            lines.append(
+                f"\n  Parse: {pd['total']} raw → {pd['passed']} ok | "
+                f"status={pd['status_filtered']} expired={pd['expired']} "
+                f"no_strike={pd['no_strike']} no_asset={pd['no_asset']}"
+            )
+            for reason in ("no_strike", "no_asset", "expired", "status_filtered"):
+                samples = pd.get("samples", {}).get(reason, [])
+                if samples:
+                    lines.append(f"    [{reason}] e.g. {', '.join(samples[:2])}")
+
         # Scan diagnostics
         d = self._last_scan_diag
         best_edge_str = f"{d['best_gross_edge']:.1f}%"
         if d["best_ticker"]:
             best_edge_str += f" ({d['best_ticker']})"
         lines.append(
-            f"\n  Last Scan: {d['raw_markets']} raw → {d['markets_scanned']} parsed → "
+            f"  Last Scan: {d['raw_markets']} raw → {d['markets_scanned']} parsed → "
+            f"{d.get('pre_screened', 0)} pre-screened → "
+            f"{d.get('orderbook_fetched', 0)} OB fetched → "
             f"{d['evaluated']} priced | "
             f"{d['near_misses']} near-miss | "
             f"{d['opportunities']} opps | "
