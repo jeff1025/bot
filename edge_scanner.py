@@ -182,6 +182,7 @@ class CategoryConfig:
     max_seconds_to_expiry: int        # Don't trade too far out
     # Risk
     max_positions_per_category: int   # Max open positions across this category
+    max_positions_per_event: int = 2  # Max positions per event (correlated risk limit)
     contracts_per_trade: int          # Contracts to buy per opportunity
     # Circuit breaker
     loss_threshold_dollars: float     # Auto-disable if category P&L below this
@@ -239,6 +240,61 @@ CATEGORY_CONFIGS = {
         min_seconds_to_expiry=180,
         max_seconds_to_expiry=3300,
         max_positions_per_category=3,
+        contracts_per_trade=1,
+        loss_threshold_dollars=-25.0,
+        min_trades_for_breaker=20,
+        min_win_rate=0.30,
+    ),
+    # ── 15-minute crypto markets ──────────────────────────────────────────
+    "crypto_15min_btc": CategoryConfig(
+        name="Crypto 15min BTC",
+        enabled=True,
+        series_tickers=["KXBTC15M"],
+        timeframe="15min",
+        fair_value_model="vol_bs",
+        min_edge_pct=20.0,
+        max_edge_pct=60.0,
+        max_price=0.85,
+        min_price=0.02,
+        min_seconds_to_expiry=90,
+        max_seconds_to_expiry=840,
+        max_positions_per_category=2,
+        contracts_per_trade=1,
+        loss_threshold_dollars=-25.0,
+        min_trades_for_breaker=20,
+        min_win_rate=0.30,
+    ),
+    "crypto_15min_eth": CategoryConfig(
+        name="Crypto 15min ETH",
+        enabled=True,
+        series_tickers=["KXETH15M"],
+        timeframe="15min",
+        fair_value_model="vol_bs",
+        min_edge_pct=20.0,
+        max_edge_pct=60.0,
+        max_price=0.85,
+        min_price=0.02,
+        min_seconds_to_expiry=90,
+        max_seconds_to_expiry=840,
+        max_positions_per_category=2,
+        contracts_per_trade=1,
+        loss_threshold_dollars=-25.0,
+        min_trades_for_breaker=20,
+        min_win_rate=0.30,
+    ),
+    "crypto_15min_sol": CategoryConfig(
+        name="Crypto 15min SOL",
+        enabled=True,
+        series_tickers=["KXSOL15M"],
+        timeframe="15min",
+        fair_value_model="vol_bs",
+        min_edge_pct=20.0,
+        max_edge_pct=60.0,
+        max_price=0.85,
+        min_price=0.02,
+        min_seconds_to_expiry=90,
+        max_seconds_to_expiry=840,
+        max_positions_per_category=2,
         contracts_per_trade=1,
         loss_threshold_dollars=-25.0,
         min_trades_for_breaker=20,
@@ -1286,6 +1342,43 @@ def _extract_strike_from_ticker(ticker: str) -> Optional[tuple]:
     return strike, direction
 
 
+def _extract_strike_from_market_data(raw: dict) -> Optional[float]:
+    """
+    Extract strike price from event subtitle, product metadata, or market fields.
+    Used for 15-min markets where the ticker doesn't encode the strike.
+    Multi-fallback approach (matches vol_live_trader_kalshi.py).
+    """
+    # 1. Subtitle: "Price to beat: $XX,XXX.XX"
+    for fld in ("_event_sub_title", "subtitle", "yes_sub_title", "no_sub_title"):
+        text = raw.get(fld, "")
+        if text and "$" in text:
+            m = re.search(r'\$?([\d,]+\.?\d*)', text.replace(',', ''))
+            if m:
+                try:
+                    return float(m.group(1))
+                except (ValueError, TypeError):
+                    pass
+
+    # 2. Event product_metadata
+    meta = raw.get("_event_product_metadata", {}) or {}
+    for key in ("strike_price", "strike", "reference_price", "price_to_beat"):
+        val = meta.get(key)
+        if val:
+            try:
+                return float(str(val).replace(',', '').replace('$', ''))
+            except (ValueError, TypeError):
+                pass
+
+    # 3. Numeric fields on the market dict itself
+    for fld in ("floor_strike", "cap_strike", "strike_price", "strike",
+                "custom_strike", "settlement_value"):
+        val = raw.get(fld)
+        if val and isinstance(val, (int, float)) and val > 0:
+            return float(val)
+
+    return None
+
+
 def _extract_asset_from_series(series_ticker: str) -> Optional[str]:
     """Extract asset from series ticker. E.g. KXBTC -> BTC, KXETH -> ETH."""
     for asset in CHAINLINK_SYMBOLS:
@@ -1371,9 +1464,14 @@ class MarketScanner:
 
         # Extract strike and direction from ticker
         parsed = _extract_strike_from_ticker(ticker)
-        if not parsed:
-            return None
-        strike, direction = parsed
+        if parsed:
+            strike, direction = parsed
+        else:
+            # Fallback: extract strike from subtitle/metadata (15-min markets)
+            strike = _extract_strike_from_market_data(raw)
+            if not strike:
+                return None
+            direction = None  # Signal: both sides should be evaluated
 
         # Extract asset
         series = raw.get("_series", "")
@@ -1408,6 +1506,7 @@ class OpenPosition:
     """Tracked open position."""
     trade_id: str
     ticker: str
+    event_ticker: str
     category: str
     asset: str
     direction: str
@@ -1462,6 +1561,10 @@ class PositionTracker:
     def count_by_ticker(self, ticker: str) -> int:
         with self._lock:
             return sum(1 for p in self._positions.values() if p.ticker == ticker)
+
+    def count_by_event(self, event_ticker: str) -> int:
+        with self._lock:
+            return sum(1 for p in self._positions.values() if p.event_ticker == event_ticker)
 
 
 # =============================================================================
@@ -1692,6 +1795,10 @@ class EdgeScanner:
             return None
         if self.positions.count_by_category(category) >= config.max_positions_per_category:
             return None
+        # Event-level limit (correlated risk across strikes in same event)
+        event_ticker = parsed.get("event_ticker", "")
+        if event_ticker and self.positions.count_by_event(event_ticker) >= config.max_positions_per_event:
+            return None
 
         # Compute fair value
         fv_result = self.compute_fair_value(category, asset, strike, seconds_left, direction)
@@ -1849,6 +1956,7 @@ class EdgeScanner:
         pos = OpenPosition(
             trade_id=trade_id,
             ticker=opp.ticker,
+            event_ticker=opp.event_ticker,
             category=opp.category,
             asset=opp.asset,
             direction=opp.direction,
@@ -2090,7 +2198,15 @@ class EdgeScanner:
         parsed_markets = []
         for raw in raw_markets:
             parsed = self.scanner.parse_market(raw, now)
-            if parsed:
+            if not parsed:
+                continue
+            if parsed["direction"] is None:
+                # 15-min market: evaluate both up (YES) and down (NO) sides
+                for d in ("up", "down"):
+                    entry = dict(parsed)
+                    entry["direction"] = d
+                    parsed_markets.append(entry)
+            else:
                 parsed_markets.append(parsed)
 
         # 3. Evaluate each market for edge
@@ -2110,8 +2226,17 @@ class EdgeScanner:
             if opp:
                 opportunities.append(opp)
 
-        # 4. Rank by net edge (best first)
-        opportunities.sort(key=lambda o: o.net_edge_pct, reverse=True)
+        # 4. Rank by net edge (best first), with near-the-money preference as tiebreaker
+        def _rank_key(opp):
+            # Primary: net edge (higher is better)
+            # Secondary: closeness to ATM (lower moneyness distance is better)
+            if opp.spot > 0 and opp.strike > 0:
+                moneyness_distance = abs(math.log(opp.spot / opp.strike))
+            else:
+                moneyness_distance = 999
+            return (opp.net_edge_pct, -moneyness_distance)
+
+        opportunities.sort(key=_rank_key, reverse=True)
 
         # 5. Execute (best first, within limits)
         trades_executed = 0
@@ -2123,6 +2248,9 @@ class EdgeScanner:
             if config and self.positions.count_by_category(opp.category) >= config.max_positions_per_category:
                 continue
             if self.positions.count_by_ticker(opp.ticker) >= MAX_POSITIONS_PER_MARKET:
+                continue
+            # Event-level limit (correlated risk)
+            if config and opp.event_ticker and self.positions.count_by_event(opp.event_ticker) >= config.max_positions_per_event:
                 continue
 
             trade_id = await self.execute_opportunity(opp)
