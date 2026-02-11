@@ -127,6 +127,27 @@ def get_dashboard_data() -> dict:
         # Load current overrides
         overrides = load_overrides()
 
+        # Shadow trades — settled ones for calibration analysis
+        shadow_settled = []
+        shadow_pending = 0
+        try:
+            for row in db.execute(
+                "SELECT id, timestamp, category, asset, ticker, direction, "
+                "strike, spot, seconds_left, close_time, model_vol, model_fair, "
+                "ask_price, gross_edge_pct, net_edge_pct, fee, "
+                "settled, settlement_result, won, hypothetical_pnl, settled_at "
+                "FROM shadow_trades WHERE settled=1 AND settlement_result IN ('yes','no') "
+                "ORDER BY settled_at ASC"
+            ):
+                shadow_settled.append(dict(row))
+
+            row = db.execute(
+                "SELECT COUNT(*) FROM shadow_trades WHERE settled=0"
+            ).fetchone()
+            shadow_pending = row[0] if row else 0
+        except Exception:
+            pass  # Table may not exist yet
+
         db.close()
 
         return {
@@ -137,6 +158,8 @@ def get_dashboard_data() -> dict:
             "daily_pnl": round(daily_pnl, 2),
             "total_pnl": round(total_pnl, 2),
             "overrides": overrides,
+            "shadow_settled": shadow_settled,
+            "shadow_pending": shadow_pending,
         }
     except Exception as e:
         db.close()
@@ -313,6 +336,28 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   <div class="chart-wrap">
     <div class="subtitle">P&L by Hour of Day (UTC)</div>
     <canvas id="hourChart" height="110"></canvas>
+  </div>
+</div>
+
+<!-- Shadow Trade Analysis -->
+<div class="config-section">
+  <h2>Shadow Trade Analysis — Model Calibration</h2>
+  <div id="shadow-summary" style="margin-bottom:14px;font-size:12px;color:#94a3b8"></div>
+  <div class="charts-row" style="max-width:100%;margin:0 0 16px 0">
+    <div class="chart-wrap">
+      <div class="subtitle">Model Calibration — Fair Value vs Actual Win Rate</div>
+      <canvas id="calibrationChart" height="130"></canvas>
+    </div>
+    <div class="chart-wrap">
+      <div class="subtitle">Missed Profit by Edge Bucket — If You Had Traded</div>
+      <canvas id="missedProfitChart" height="130"></canvas>
+    </div>
+  </div>
+  <div class="charts-row" style="max-width:100%;margin:0">
+    <div class="chart-wrap full">
+      <div class="subtitle">Cumulative Shadow P&L — What Every Positive-Edge Trade Would Have Earned</div>
+      <canvas id="shadowPnlChart" height="70"></canvas>
+    </div>
   </div>
 </div>
 
@@ -522,6 +567,48 @@ function initCharts() {
     data: { labels: [], datasets: [] },
     options: { ...defaultOpts, plugins: { legend: { display: false } } }
   });
+
+  // Shadow: Calibration scatter
+  charts.calibration = new Chart(document.getElementById('calibrationChart'), {
+    type: 'bar',
+    data: { labels: [], datasets: [] },
+    options: {
+      ...defaultOpts,
+      plugins: {
+        legend: { display: true, labels: { color: '#475569', font: { size: 10, family: "'JetBrains Mono'" } } },
+        tooltip: { callbacks: { label: ctx => ctx.dataset.label + ': ' + ctx.parsed.y.toFixed(0) + '%' } }
+      },
+      scales: {
+        ...defaultOpts.scales,
+        y: { ...defaultOpts.scales.y, min: 0, max: 100, title: { display: true, text: 'Win %', color: '#475569', font: { size: 10 } } }
+      }
+    }
+  });
+
+  // Shadow: Missed profit by edge bucket
+  charts.missedProfit = new Chart(document.getElementById('missedProfitChart'), {
+    type: 'bar',
+    data: { labels: [], datasets: [] },
+    options: {
+      ...defaultOpts,
+      plugins: { legend: { display: false } },
+      scales: {
+        ...defaultOpts.scales,
+        y: { ...defaultOpts.scales.y, title: { display: true, text: 'P&L $', color: '#475569', font: { size: 10 } } }
+      }
+    }
+  });
+
+  // Shadow: Cumulative shadow P&L
+  charts.shadowPnl = new Chart(document.getElementById('shadowPnlChart'), {
+    type: 'line',
+    data: { labels: [], datasets: [] },
+    options: {
+      ...defaultOpts,
+      plugins: { ...defaultOpts.plugins, legend: { display: true, labels: { color: '#475569', font: { size: 10, family: "'JetBrains Mono'" } } } },
+      elements: { point: { radius: 1 }, line: { tension: 0.2, borderWidth: 2 } },
+    }
+  });
 }
 
 function updateCharts(data) {
@@ -612,6 +699,138 @@ function updateCharts(data) {
   charts.hour.update('none');
 }
 
+// ── Shadow Trade Analysis ────────────────────────────────────────────────────
+
+function renderShadowAnalysis(data) {
+  const shadow = data.shadow_settled || [];
+  const pending = data.shadow_pending || 0;
+  const el = document.getElementById('shadow-summary');
+
+  if (shadow.length === 0) {
+    el.innerHTML = `Tracking ${pending} pending shadow trades. Waiting for settlements to build calibration data...`;
+    return;
+  }
+
+  // Summary stats
+  const totalShadow = shadow.length;
+  const wins = shadow.filter(t => t.won === 1).length;
+  const wr = (wins / totalShadow * 100).toFixed(1);
+  const totalPnl = shadow.reduce((s, t) => s + (t.hypothetical_pnl || 0), 0);
+  const avgEdge = (shadow.reduce((s, t) => s + (t.gross_edge_pct || 0), 0) / totalShadow).toFixed(1);
+
+  // Find optimal threshold: lowest edge bucket with >50% win rate and positive cumulative P&L
+  const edgeBuckets = [0, 3, 5, 8, 10, 15, 20, 25, 30, 40];
+  let optimalThreshold = '?';
+  for (const minE of edgeBuckets) {
+    const above = shadow.filter(t => t.gross_edge_pct >= minE);
+    if (above.length >= 5) {
+      const aboveWins = above.filter(t => t.won === 1).length;
+      const abovePnl = above.reduce((s, t) => s + (t.hypothetical_pnl || 0), 0);
+      if (aboveWins / above.length > 0.5 && abovePnl > 0) {
+        optimalThreshold = minE + '%';
+        break;
+      }
+    }
+  }
+
+  const pnlColor = totalPnl >= 0 ? '#22c55e' : '#ef4444';
+  el.innerHTML =
+    `<span style="color:#e2e8f0">${totalShadow}</span> settled shadows | ` +
+    `<span style="color:${pnlColor}">$${totalPnl >= 0 ? '+' : ''}${totalPnl.toFixed(2)}</span> hypothetical P&L | ` +
+    `<span style="color:#e2e8f0">${wr}%</span> win rate | ` +
+    `avg edge <span style="color:#e2e8f0">${avgEdge}%</span> | ` +
+    `<span style="color:#94a3b8">${pending} pending</span> | ` +
+    `suggested threshold: <span style="color:#6366f1;font-weight:700">${optimalThreshold}</span>`;
+
+  // 1. Calibration chart: model fair value buckets vs actual win rate
+  const calBuckets = [
+    {lo: 0.05, hi: 0.20, label: '5-20%'},
+    {lo: 0.20, hi: 0.35, label: '20-35%'},
+    {lo: 0.35, hi: 0.50, label: '35-50%'},
+    {lo: 0.50, hi: 0.65, label: '50-65%'},
+    {lo: 0.65, hi: 0.80, label: '65-80%'},
+    {lo: 0.80, hi: 0.95, label: '80-95%'},
+  ];
+  const calLabels = [];
+  const calPredicted = [];
+  const calActual = [];
+  const calCounts = [];
+  for (const b of calBuckets) {
+    const inBucket = shadow.filter(t => t.model_fair >= b.lo && t.model_fair < b.hi);
+    if (inBucket.length < 2) continue;
+    const midpoint = ((b.lo + b.hi) / 2 * 100);
+    const actualWR = inBucket.filter(t => t.won === 1).length / inBucket.length * 100;
+    calLabels.push(b.label + ` (n=${inBucket.length})`);
+    calPredicted.push(+midpoint.toFixed(1));
+    calActual.push(+actualWR.toFixed(1));
+  }
+  charts.calibration.data.labels = calLabels;
+  charts.calibration.data.datasets = [
+    { label: 'Model Predicted', data: calPredicted, backgroundColor: 'rgba(99,102,241,0.5)', borderColor: '#6366f1', borderWidth: 1, borderRadius: 4 },
+    { label: 'Actual Win Rate', data: calActual, backgroundColor: 'rgba(34,197,94,0.5)', borderColor: '#22c55e', borderWidth: 1, borderRadius: 4 },
+  ];
+  charts.calibration.update('none');
+
+  // 2. Missed profit by edge bucket
+  const profitBuckets = [
+    {lo: 0, hi: 5, label: '0-5%'},
+    {lo: 5, hi: 10, label: '5-10%'},
+    {lo: 10, hi: 15, label: '10-15%'},
+    {lo: 15, hi: 20, label: '15-20%'},
+    {lo: 20, hi: 25, label: '20-25%'},
+    {lo: 25, hi: 35, label: '25-35%'},
+    {lo: 35, hi: 60, label: '35-60%'},
+  ];
+  const profitLabels = [];
+  const profitData = [];
+  const profitColors = [];
+  const profitCounts = [];
+  for (const b of profitBuckets) {
+    const inBucket = shadow.filter(t => t.gross_edge_pct >= b.lo && t.gross_edge_pct < b.hi);
+    if (inBucket.length === 0) { profitLabels.push(b.label); profitData.push(0); profitColors.push('#334155'); profitCounts.push(0); continue; }
+    const pnl = inBucket.reduce((s, t) => s + (t.hypothetical_pnl || 0), 0);
+    profitLabels.push(b.label + ` (n=${inBucket.length})`);
+    profitData.push(+pnl.toFixed(2));
+    profitColors.push(pnl >= 0 ? '#22c55e' : '#ef4444');
+    profitCounts.push(inBucket.length);
+  }
+  charts.missedProfit.data.labels = profitLabels;
+  charts.missedProfit.data.datasets = [{ data: profitData, backgroundColor: profitColors, borderRadius: 4 }];
+  charts.missedProfit.update('none');
+
+  // 3. Cumulative shadow P&L over time (total + by threshold level)
+  if (shadow.length > 0) {
+    const sorted = [...shadow].sort((a, b) => (a.settled_at || '').localeCompare(b.settled_at || ''));
+    const labels = sorted.map(t => (t.settled_at || '').slice(5, 16).replace('T', ' '));
+
+    const thresholds = [
+      {min: 0, label: 'All > 0%', color: '#94a3b8'},
+      {min: 5, label: '> 5%', color: '#6366f1'},
+      {min: 10, label: '> 10%', color: '#22d3ee'},
+      {min: 15, label: '> 15%', color: '#eab308'},
+      {min: 25, label: '> 25%', color: '#22c55e'},
+    ];
+
+    const datasets = [];
+    for (const th of thresholds) {
+      let cum = 0;
+      const line = sorted.map(t => {
+        if (t.gross_edge_pct >= th.min) cum += (t.hypothetical_pnl || 0);
+        return +cum.toFixed(2);
+      });
+      datasets.push({
+        label: th.label, data: line, borderColor: th.color,
+        backgroundColor: 'transparent', borderWidth: th.min === 0 ? 2 : 1.5,
+        borderDash: th.min === 25 ? [] : [4, 2],
+      });
+    }
+
+    charts.shadowPnl.data.labels = labels;
+    charts.shadowPnl.data.datasets = datasets;
+    charts.shadowPnl.update('none');
+  }
+}
+
 // ── Fetch & refresh ──────────────────────────────────────────────────────────
 
 async function refresh() {
@@ -623,6 +842,7 @@ async function refresh() {
     renderCatTable(data);
     renderTradesTable(data);
     updateCharts(data);
+    renderShadowAnalysis(data);
   } catch (e) {
     console.error('Refresh error:', e);
   }

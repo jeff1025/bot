@@ -439,6 +439,45 @@ def init_db(db_path: str = DB_PATH) -> sqlite3.Connection:
     """)
 
     conn.execute("""
+        CREATE TABLE IF NOT EXISTS shadow_trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            category TEXT NOT NULL,
+            asset TEXT NOT NULL,
+            ticker TEXT NOT NULL,
+            event_ticker TEXT,
+            direction TEXT NOT NULL,
+            strike REAL NOT NULL,
+            spot REAL NOT NULL,
+            seconds_left REAL NOT NULL,
+            close_time TEXT NOT NULL,
+            model_vol REAL NOT NULL,
+            model_fair REAL NOT NULL,
+            ask_price REAL NOT NULL,
+            gross_edge_pct REAL NOT NULL,
+            net_edge_pct REAL NOT NULL,
+            fee REAL NOT NULL,
+            implied_vol REAL,
+            -- Settlement (filled in later)
+            settled INTEGER DEFAULT 0,
+            settlement_result TEXT,
+            won INTEGER,
+            hypothetical_pnl REAL,
+            settled_at TEXT
+        )
+    """)
+
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_shadow_settled ON shadow_trades(settled)
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_shadow_ticker ON shadow_trades(ticker)
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_shadow_close_time ON shadow_trades(close_time)
+    """)
+
+    conn.execute("""
         CREATE INDEX IF NOT EXISTS idx_trades_category ON trades(category)
     """)
     conn.execute("""
@@ -1940,6 +1979,18 @@ class EdgeScanner:
             diag["best_gross_edge"] = gross_edge_pct
             diag["best_ticker"] = ticker
 
+        # Log shadow trade for every priced market with positive edge
+        if gross_edge_pct > 0:
+            self._log_shadow_trade(
+                category=category, asset=asset, ticker=ticker,
+                event_ticker=candidate.get("event_ticker", ""),
+                direction=direction, strike=strike, spot=spot,
+                seconds_left=seconds_left, close_time=close_time,
+                model_vol=vol, model_fair=fair, ask_price=ask_price,
+                gross_edge_pct=gross_edge_pct, net_edge_pct=net_edge_pct,
+                fee=fee, implied_vol=None,
+            )
+
         # Edge filters
         if gross_edge_pct < config.min_edge_pct:
             if gross_edge_pct > 0:
@@ -2145,6 +2196,47 @@ class EdgeScanner:
         except Exception as e:
             logger.error(f"DB write error: {e}")
 
+    def _log_shadow_trade(
+        self,
+        category: str, asset: str, ticker: str, event_ticker: str,
+        direction: str, strike: float, spot: float, seconds_left: float,
+        close_time: datetime, model_vol: float, model_fair: float,
+        ask_price: float, gross_edge_pct: float, net_edge_pct: float,
+        fee: float, implied_vol: Optional[float],
+    ):
+        """Log a shadow trade — every priced market with positive edge, regardless of threshold."""
+        try:
+            # Deduplicate: only log once per ticker+direction per close_time window
+            # (same market scanned every 15s, we only need one entry per market window)
+            existing = self.db.execute(
+                "SELECT id FROM shadow_trades WHERE ticker=? AND direction=? AND settled=0 LIMIT 1",
+                (ticker, direction),
+            ).fetchone()
+            if existing:
+                return  # Already tracking this market
+
+            self.db.execute(
+                """
+                INSERT INTO shadow_trades (
+                    timestamp, category, asset, ticker, event_ticker, direction,
+                    strike, spot, seconds_left, close_time,
+                    model_vol, model_fair, ask_price,
+                    gross_edge_pct, net_edge_pct, fee, implied_vol
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    datetime.now(timezone.utc).isoformat(),
+                    category, asset, ticker, event_ticker, direction,
+                    strike, spot, seconds_left,
+                    close_time.isoformat() if isinstance(close_time, datetime) else str(close_time),
+                    model_vol, model_fair, ask_price,
+                    gross_edge_pct, net_edge_pct, fee, implied_vol,
+                ),
+            )
+            self.db.commit()
+        except Exception as e:
+            logger.debug(f"Shadow trade log error: {e}")
+
     # ── Settlement Monitoring ───────────────────────────────────────────────
 
     async def check_settlements(self):
@@ -2225,6 +2317,81 @@ class EdgeScanner:
 
             except Exception as e:
                 logger.debug(f"Settlement check error for {pos.ticker}: {e}")
+
+    # ── Shadow Settlement ─────────────────────────────────────────────────
+
+    async def check_shadow_settlements(self):
+        """
+        Resolve unsettled shadow trades. For each, check if the market
+        has settled, then compute whether a hypothetical buy would have won.
+        """
+        now = datetime.now(timezone.utc)
+
+        # Get unsettled shadow trades whose close_time has passed
+        rows = self.db.execute(
+            """
+            SELECT id, ticker, direction, close_time, ask_price, fee, model_fair
+            FROM shadow_trades
+            WHERE settled=0 AND close_time < ?
+            ORDER BY close_time ASC
+            LIMIT 50
+            """,
+            ((now - timedelta(seconds=30)).isoformat(),),
+        ).fetchall()
+
+        if not rows:
+            return
+
+        # Batch by unique ticker to avoid duplicate API calls
+        ticker_results = {}
+        for row in rows:
+            row_id, ticker, direction, close_time_str, ask_price, fee, model_fair = row
+            if ticker not in ticker_results:
+                try:
+                    settlement = await self.api.get_market_settlement(ticker)
+                    ticker_results[ticker] = settlement
+                except Exception as e:
+                    logger.debug(f"Shadow settlement check error for {ticker}: {e}")
+                    ticker_results[ticker] = {"settled": False}
+
+            settlement = ticker_results[ticker]
+            if not settlement.get("settled"):
+                # Check if it's very old (>10 min past close) — mark as expired
+                try:
+                    ct = datetime.fromisoformat(close_time_str.replace("Z", "+00:00"))
+                    if (now - ct).total_seconds() > 600:
+                        self.db.execute(
+                            "UPDATE shadow_trades SET settled=1, settlement_result='expired', settled_at=? WHERE id=?",
+                            (now.isoformat(), row_id),
+                        )
+                except Exception:
+                    pass
+                continue
+
+            result = settlement.get("result", "")
+
+            # Determine if hypothetical trade would have won
+            side = "yes" if direction == "up" else "no"
+            won = (side == "yes" and result == "yes") or (side == "no" and result == "no")
+
+            # Hypothetical P&L: buy 1 contract at ask_price
+            payout = 1.0 if won else 0.0
+            hypothetical_pnl = payout - ask_price - fee
+
+            self.db.execute(
+                """
+                UPDATE shadow_trades SET
+                    settled=1, settlement_result=?, won=?, hypothetical_pnl=?, settled_at=?
+                WHERE id=?
+                """,
+                (result, 1 if won else 0, hypothetical_pnl, now.isoformat(), row_id),
+            )
+
+        self.db.commit()
+
+        settled_count = sum(1 for t in ticker_results.values() if t.get("settled"))
+        if settled_count > 0:
+            logger.info(f"SHADOW: Settled {settled_count} shadow trades")
 
     # ── Reconciliation ──────────────────────────────────────────────────────
 
@@ -2630,9 +2797,10 @@ class EdgeScanner:
                 # Main scan
                 await self.scan_once()
 
-                # Settlement checks
+                # Settlement checks (real + shadow)
                 if time.time() - last_settlement_check > SETTLEMENT_CHECK_INTERVAL:
                     await self.check_settlements()
+                    await self.check_shadow_settlements()
                     last_settlement_check = time.time()
 
                 # Reconciliation
