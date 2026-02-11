@@ -1733,6 +1733,19 @@ class EdgeScanner:
         # Track disabled categories (from circuit breakers)
         self._disabled_categories: set = set()
 
+        # Scan diagnostics (updated each scan, shown on dashboard)
+        self._last_scan_diag: dict = {
+            "markets_scanned": 0,
+            "evaluated": 0,
+            "opportunities": 0,
+            "best_gross_edge": 0.0,
+            "best_ticker": "",
+            "near_misses": 0,       # edge > 0 but below threshold
+            "no_edge": 0,           # fair <= ask (no edge at all)
+            "price_filtered": 0,    # ask outside price range
+            "time_filtered": 0,     # expiry outside time range
+        }
+
     # ── Fair Value Models ───────────────────────────────────────────────────
 
     def _fair_value_vol_bs(
@@ -1790,10 +1803,14 @@ class EdgeScanner:
         seconds_left = parsed["seconds_left"]
         close_time = parsed["close_time"]
 
+        diag = self._last_scan_diag
+
         # Time filter
         if seconds_left < config.min_seconds_to_expiry:
+            diag["time_filtered"] += 1
             return None
         if seconds_left > config.max_seconds_to_expiry:
+            diag["time_filtered"] += 1
             return None
 
         # Check position limits
@@ -1824,7 +1841,10 @@ class EdgeScanner:
 
         # Price filters
         if ask_price < config.min_price or ask_price > config.max_price:
+            diag["price_filtered"] += 1
             return None
+
+        diag["evaluated"] += 1
 
         # Gross edge
         gross_edge_pct = ((fair - ask_price) / fair) * 100 if fair > 0 else 0
@@ -1833,8 +1853,17 @@ class EdgeScanner:
         contracts = config.contracts_per_trade
         net_edge_pct, fee, net_profit = net_edge_after_fees(fair, ask_price, contracts)
 
+        # Track best edge seen this scan (even if below threshold)
+        if gross_edge_pct > diag["best_gross_edge"]:
+            diag["best_gross_edge"] = gross_edge_pct
+            diag["best_ticker"] = ticker
+
         # Edge filters
         if gross_edge_pct < config.min_edge_pct:
+            if gross_edge_pct > 0:
+                diag["near_misses"] += 1
+            else:
+                diag["no_edge"] += 1
             return None
         if gross_edge_pct > config.max_edge_pct:
             logger.debug(
@@ -2178,6 +2207,13 @@ class EdgeScanner:
         scan_start = time.time()
         now = datetime.now(timezone.utc)
 
+        # Reset scan diagnostics
+        self._last_scan_diag = {
+            "markets_scanned": 0, "evaluated": 0, "opportunities": 0,
+            "best_gross_edge": 0.0, "best_ticker": "",
+            "near_misses": 0, "no_edge": 0, "price_filtered": 0, "time_filtered": 0,
+        }
+
         # Global checks
         if self.positions.count_total() >= MAX_OPEN_POSITIONS_GLOBAL:
             logger.debug("Global position limit reached, skipping scan")
@@ -2216,6 +2252,7 @@ class EdgeScanner:
                 parsed_markets.append(parsed)
 
         # 3. Evaluate each market for edge
+        self._last_scan_diag["markets_scanned"] = len(parsed_markets)
         opportunities = []
         for parsed in parsed_markets:
             config = CATEGORY_CONFIGS.get(parsed["category"])
@@ -2231,6 +2268,8 @@ class EdgeScanner:
             opp = await self.evaluate_market(parsed, config)
             if opp:
                 opportunities.append(opp)
+
+        self._last_scan_diag["opportunities"] = len(opportunities)
 
         # 4. Rank by net edge (best first), with near-the-money preference as tiebreaker
         def _rank_key(opp):
@@ -2351,10 +2390,23 @@ class EdgeScanner:
                 f"positions={cat_pos}/{config.max_positions_per_category}"
             )
 
+        # Scan diagnostics
+        d = self._last_scan_diag
+        best_edge_str = f"{d['best_gross_edge']:.1f}%"
+        if d["best_ticker"]:
+            best_edge_str += f" ({d['best_ticker']})"
+        lines.append(
+            f"\n  Last Scan: {d['markets_scanned']} markets | "
+            f"{d['evaluated']} priced | "
+            f"{d['near_misses']} near-miss | "
+            f"{d['opportunities']} opportunities | "
+            f"best edge={best_edge_str}"
+        )
+
         # Global stats
         daily_pnl = self.cat_stats.get_daily_pnl()
         hourly_count = len(self._hourly_trades)
-        lines.append(f"\n  Daily P&L: ${daily_pnl:+.2f} | Trades/hr: {hourly_count}/{MAX_TRADES_PER_HOUR}")
+        lines.append(f"  Daily P&L: ${daily_pnl:+.2f} | Trades/hr: {hourly_count}/{MAX_TRADES_PER_HOUR}")
 
         # Disabled categories
         if self._disabled_categories:
