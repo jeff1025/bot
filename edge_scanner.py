@@ -1222,7 +1222,6 @@ class KalshiAPI:
                 "type": "limit",
                 "count": int(count),
                 f"{side}_price": price_cents,
-                "time_in_force": "ioc",
                 "client_order_id": str(uuid.uuid4()),
             }
 
