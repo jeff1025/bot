@@ -127,6 +127,16 @@ def get_dashboard_data() -> dict:
         # Load current overrides
         overrides = load_overrides()
 
+        # Load bankroll state from JSON (written by edge_scanner)
+        bankroll = {}
+        bankroll_path = DATA_DIR / "bankroll_state.json"
+        if bankroll_path.exists():
+            try:
+                with open(bankroll_path, "r") as f:
+                    bankroll = json.load(f)
+            except (json.JSONDecodeError, IOError):
+                pass
+
         # Shadow trades — settled ones for calibration analysis
         shadow_settled = []
         shadow_pending = 0
@@ -158,6 +168,7 @@ def get_dashboard_data() -> dict:
             "daily_pnl": round(daily_pnl, 2),
             "total_pnl": round(total_pnl, 2),
             "overrides": overrides,
+            "bankroll": bankroll,
             "shadow_settled": shadow_settled,
             "shadow_pending": shadow_pending,
         }
@@ -211,6 +222,27 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .card .value.green { color: #22c55e; }
   .card .value.red { color: #ef4444; }
   .card .value.neutral { color: #94a3b8; }
+  .card .value.yellow { color: #eab308; }
+
+  /* Bankroll panel */
+  .bankroll-section {
+    max-width: 1100px; margin: 0 auto 16px;
+  }
+  .bankroll-section h3 {
+    font-size: 11px; color: #64748b; text-transform: uppercase;
+    letter-spacing: 0.08em; margin: 0 0 8px 4px;
+  }
+  .bankroll-row {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px;
+  }
+  .bankroll-row .card { border-color: #3b4f6b; }
+  .bankroll-row .card.stopped { border-color: #ef4444; background: #1c1520; }
+  .stop-bar {
+    margin-top: 6px; height: 4px; border-radius: 2px; background: #334155; overflow: hidden;
+  }
+  .stop-bar-fill {
+    height: 100%; border-radius: 2px; transition: width 0.5s ease;
+  }
 
   /* Category config table */
   .config-section {
@@ -292,6 +324,12 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
 <!-- Summary Cards -->
 <div class="summary-row" id="summary-cards"></div>
+
+<!-- Bankroll Management -->
+<div class="bankroll-section" id="bankroll-section">
+  <h3>Bankroll Management</h3>
+  <div class="bankroll-row" id="bankroll-panel"></div>
+</div>
 
 <!-- Category Controls -->
 <div class="config-section">
@@ -418,6 +456,49 @@ function onEdgeCommit(catKey, val) {
 
 function pnlClass(v) { return v > 0.001 ? 'pnl-pos' : v < -0.001 ? 'pnl-neg' : 'pnl-zero'; }
 function pnlStr(v) { return (v >= 0 ? '+' : '') + v.toFixed(2); }
+
+function renderBankroll(data) {
+  const bk = data.bankroll || {};
+  const el = document.getElementById('bankroll-panel');
+  const section = document.getElementById('bankroll-section');
+  if (!el) return;
+  if (!bk.date) { section.style.display = 'none'; return; }
+  section.style.display = '';
+
+  const pnl = bk.daily_pnl || 0;
+  const hwm = bk.hwm || 0;
+  const stop = bk.stop_level || -20;
+  const tier = bk.tier || 0;
+  const contracts = bk.contracts || 1;
+  const balance = bk.balance || 0;
+  const stopped = bk.stopped || false;
+
+  const pnlCls = pnl >= 0 ? 'green' : 'red';
+  const stopCls = stop >= 0 ? 'green' : 'red';
+  const statusCls = stopped ? 'red' : 'green';
+  const statusText = stopped ? 'STOPPED' : 'ACTIVE';
+  const stoppedCard = stopped ? ' stopped' : '';
+
+  // Stop distance bar: how far P&L is from stop (as % of range)
+  const range = hwm - stop;
+  const dist = pnl - stop;
+  const pct = range > 0 ? Math.max(0, Math.min(100, (dist / range) * 100)) : 100;
+  const barColor = pct > 50 ? '#22c55e' : pct > 20 ? '#eab308' : '#ef4444';
+
+  const tierNames = ['Base', 'Scaled', 'Strong', 'Max'];
+  const tierLabel = tierNames[tier] || 'Base';
+
+  el.innerHTML = `
+    <div class="card${stoppedCard}"><div class="label">Daily P&L</div><div class="value ${pnlCls}">$${pnlStr(pnl)}</div></div>
+    <div class="card${stoppedCard}"><div class="label">High Water Mark</div><div class="value neutral">$${hwm.toFixed(2)}</div></div>
+    <div class="card${stoppedCard}"><div class="label">Stop Level</div><div class="value ${stopCls}">$${pnlStr(stop)}</div>
+      <div class="stop-bar"><div class="stop-bar-fill" style="width:${pct.toFixed(0)}%;background:${barColor}"></div></div>
+    </div>
+    <div class="card${stoppedCard}"><div class="label">Tier</div><div class="value neutral">${tierLabel} (${contracts}x)</div></div>
+    <div class="card${stoppedCard}"><div class="label">Balance</div><div class="value ${balance < 5 ? 'yellow' : 'neutral'}">$${balance.toFixed(2)}</div></div>
+    <div class="card${stoppedCard}"><div class="label">Status</div><div class="value ${statusCls}">${statusText}</div></div>
+  `;
+}
 
 function renderSummary(data) {
   const settled = data.settled || [];
@@ -839,6 +920,7 @@ async function refresh() {
     const data = await r.json();
     lastData = data;
     renderSummary(data);
+    renderBankroll(data);
     renderCatTable(data);
     renderTradesTable(data);
     updateCharts(data);

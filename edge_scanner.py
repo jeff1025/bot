@@ -127,9 +127,20 @@ KALSHI_MAKER_FEE_RATE = 0.0175
 # ── Global risk limits ──────────────────────────────────────────────────────
 MAX_OPEN_POSITIONS_GLOBAL = 6      # Circuit breaker: stop trading above this (tightened for 6 categories)
 MAX_POSITIONS_PER_MARKET = 1       # Max concurrent positions in a single market
-MAX_DAILY_LOSS_DOLLARS = 50.0      # Stop trading for the day if realized loss exceeds
 MAX_TRADES_PER_HOUR = 12           # Rate limit on order placement (tightened: ~2/hr per category)
-BALANCE_RESERVE_PCT = 50           # Keep this % of balance uninvested
+
+# ── Bankroll management (anti-martingale with trailing stop) ───────────────
+BANKROLL_STOP_LOSS = 20.0             # Base daily stop loss in dollars
+BANKROLL_PROFIT_LOCK_PCT = 0.60       # Lock in 60% of peak daily profit
+BANKROLL_SCALE_TIERS = [              # (min_daily_pnl, contracts_per_trade)
+    (0,   1),                         # Base: 1 contract (prove the edge)
+    (8,   2),                         # Up $8+:  scale to 2 contracts
+    (20,  3),                         # Up $20+: scale to 3 contracts
+    (40,  4),                         # Up $40+: scale to 4 contracts
+]
+BANKROLL_MAX_CONTRACTS = 4            # Hard cap on contracts per trade
+BANKROLL_DRAWDOWN_STEP_DOWN = 5.0     # Drop back 1 tier if P&L is $5+ below HWM
+BANKROLL_MAX_RISK_PCT = 0.10          # Never risk more than 10% of balance on 1 trade
 
 # ── Orderbook batching ────────────────────────────────────────────────────
 MAX_ORDERBOOK_CANDIDATES = 15      # Only fetch orderbook for top N candidates by edge potential
@@ -1776,6 +1787,168 @@ class CategoryStatsTracker:
 
 
 # =============================================================================
+# BANKROLL MANAGER — Anti-martingale with trailing stop + profit lock
+# =============================================================================
+
+class BankrollManager:
+    """
+    Dynamic bankroll management with trailing stop and profit-based upscaling.
+    Resets daily at midnight UTC.
+
+    Stop logic (anti-martingale trailing stop):
+      stop_level = max(-STOP_LOSS, HWM * PROFIT_LOCK_PCT - STOP_LOSS)
+
+      Examples (stop=$20, lock=60%):
+        HWM=$0  → stop=-$20   (base stop)
+        HWM=$10 → stop=-$14   (trailing tightens)
+        HWM=$33 → stop=~$0    (breakeven secured)
+        HWM=$50 → stop=$10    (profit locked)
+
+    Sizing: tiered contracts based on current daily P&L, with drawdown
+    step-down and balance guard.
+    """
+
+    def __init__(self, db: sqlite3.Connection):
+        self.db = db
+        self._balance: float = 0.0
+        self._stopped: bool = False
+        self._current_date: str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+        # Initialize from today's settled P&L
+        self._daily_pnl = self._query_daily_pnl()
+        self._hwm = max(0.0, self._daily_pnl)
+
+        logger.info(
+            f"BankrollManager init: P&L=${self._daily_pnl:+.2f} HWM=${self._hwm:.2f} "
+            f"stop=${self.get_stop_level():+.2f}"
+        )
+
+    def _query_daily_pnl(self) -> float:
+        """Query today's settled P&L from the trades table."""
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        row = self.db.execute(
+            "SELECT COALESCE(SUM(pnl), 0) FROM trades WHERE settled=1 AND settled_at LIKE ?",
+            (f"{today}%",),
+        ).fetchone()
+        return row[0] if row else 0.0
+
+    def update_pnl(self):
+        """Refresh daily P&L from DB. Handles midnight reset."""
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if today != self._current_date:
+            # New day — reset everything
+            logger.info(
+                f"BankrollManager daily reset: {self._current_date} → {today} "
+                f"(prev HWM=${self._hwm:.2f}, P&L=${self._daily_pnl:+.2f})"
+            )
+            self._current_date = today
+            self._hwm = 0.0
+            self._stopped = False
+
+        self._daily_pnl = self._query_daily_pnl()
+        self._hwm = max(self._hwm, self._daily_pnl)
+
+    def update_balance(self, balance: float):
+        """Store latest Kalshi account balance (in dollars)."""
+        self._balance = balance
+
+    def get_stop_level(self) -> float:
+        """Compute dynamic stop level based on HWM and profit lock."""
+        secured = self._hwm * BANKROLL_PROFIT_LOCK_PCT
+        return max(-BANKROLL_STOP_LOSS, secured - BANKROLL_STOP_LOSS)
+
+    def should_stop(self) -> tuple:
+        """
+        Check if trading should halt.
+        Returns (stopped: bool, reason: str).
+        Once triggered, latches for the rest of the day.
+        """
+        if self._stopped:
+            return (True, f"Stopped earlier today (P&L=${self._daily_pnl:+.2f})")
+
+        stop_level = self.get_stop_level()
+        if self._daily_pnl < stop_level:
+            self._stopped = True
+            reason = (
+                f"P&L ${self._daily_pnl:+.2f} hit stop ${stop_level:+.2f} "
+                f"(HWM=${self._hwm:.2f}, lock={BANKROLL_PROFIT_LOCK_PCT:.0%})"
+            )
+            logger.warning(f"BANKROLL STOP: {reason}")
+            self.write_state_file()
+            return (True, reason)
+
+        return (False, "")
+
+    def get_tier(self) -> int:
+        """Return current tier index (0-based) from BANKROLL_SCALE_TIERS."""
+        tier = 0
+        for i, (threshold, _contracts) in enumerate(BANKROLL_SCALE_TIERS):
+            if self._daily_pnl >= threshold:
+                tier = i
+        return tier
+
+    def get_contracts(self, ask_price: float) -> int:
+        """
+        Determine contract count for a trade.
+        Uses tiered scaling with drawdown guard and balance guard.
+        """
+        if ask_price <= 0:
+            return 1
+
+        # Find tier based on current daily P&L
+        tier = self.get_tier()
+        contracts = BANKROLL_SCALE_TIERS[tier][1]
+
+        # Drawdown guard: if P&L has dropped $5+ from HWM, step down 1 tier
+        drawdown = self._hwm - self._daily_pnl
+        if drawdown >= BANKROLL_DRAWDOWN_STEP_DOWN and tier > 0:
+            tier -= 1
+            contracts = BANKROLL_SCALE_TIERS[tier][1]
+            logger.debug(
+                f"Bankroll drawdown guard: HWM=${self._hwm:.2f} "
+                f"P&L=${self._daily_pnl:+.2f} (dd=${drawdown:.2f}) → tier {tier} ({contracts}x)"
+            )
+
+        # Hard cap
+        contracts = min(contracts, BANKROLL_MAX_CONTRACTS)
+
+        # Balance guard: don't risk more than 10% of balance on one trade
+        if self._balance > 0:
+            max_by_balance = int(self._balance * BANKROLL_MAX_RISK_PCT / ask_price)
+            if max_by_balance < contracts:
+                logger.debug(
+                    f"Bankroll balance guard: ${self._balance:.2f} × {BANKROLL_MAX_RISK_PCT:.0%} "
+                    f"/ ${ask_price:.2f} = {max_by_balance} contracts (wanted {contracts})"
+                )
+                contracts = max_by_balance
+
+        return max(contracts, 0)
+
+    def get_state(self) -> dict:
+        """Return snapshot of bankroll state for dashboard/logging."""
+        tier = self.get_tier()
+        return {
+            "daily_pnl": round(self._daily_pnl, 2),
+            "hwm": round(self._hwm, 2),
+            "stop_level": round(self.get_stop_level(), 2),
+            "tier": tier,
+            "contracts": BANKROLL_SCALE_TIERS[tier][1],
+            "balance": round(self._balance, 2),
+            "stopped": self._stopped,
+            "date": self._current_date,
+        }
+
+    def write_state_file(self):
+        """Write bankroll state to JSON for the web dashboard to read."""
+        try:
+            state_path = os.path.join(LOG_DIR, "bankroll_state.json")
+            with open(state_path, "w") as f:
+                json.dump(self.get_state(), f, indent=2)
+        except Exception:
+            pass  # Best-effort; don't crash on file write failure
+
+
+# =============================================================================
 # EDGE SCANNER ENGINE — The core scanning + execution loop
 # =============================================================================
 
@@ -1805,6 +1978,7 @@ class EdgeScanner:
         self.scanner = MarketScanner(api)
         self.positions = PositionTracker()
         self.cat_stats = CategoryStatsTracker(self.db)
+        self.bankroll = BankrollManager(self.db)
 
         # Connect Chainlink price feed to vol tracker
         self.chainlink.on_price(self.vol_tracker.feed_price)
@@ -2050,7 +2224,10 @@ class EdgeScanner:
         if not config:
             return None
 
-        contracts = config.contracts_per_trade
+        contracts = self.bankroll.get_contracts(opp.ask_price)
+        if contracts <= 0:
+            logger.warning(f"Bankroll: insufficient balance for {opp.ticker}")
+            return None
         side = "yes" if opp.direction == "up" else "no"
         trade_id = f"ES-{int(time.time())}-{uuid.uuid4().hex[:6]}"
 
@@ -2381,6 +2558,8 @@ class EdgeScanner:
         self.db.commit()
 
         self.cat_stats.record_settlement(category, won, pnl, cost, payout)
+        self.bankroll.update_pnl()
+        self.bankroll.write_state_file()
 
         disable_reason = self.cat_stats.check_circuit_breaker(category)
         if disable_reason and category not in self._disabled_categories:
@@ -2643,11 +2822,12 @@ class EdgeScanner:
             logger.debug("Global position limit reached, skipping scan")
             return {"markets_scanned": 0, "opportunities": 0, "trades": 0, "skipped": "position_limit"}
 
-        # Daily loss check
-        daily_pnl = self.cat_stats.get_daily_pnl()
-        if daily_pnl < -MAX_DAILY_LOSS_DOLLARS:
-            logger.warning(f"Daily loss limit reached: ${daily_pnl:.2f}")
-            return {"markets_scanned": 0, "opportunities": 0, "trades": 0, "skipped": "daily_loss"}
+        # Bankroll stop check (trailing stop with profit lock)
+        self.bankroll.update_pnl()
+        stopped, reason = self.bankroll.should_stop()
+        if stopped:
+            logger.warning(f"Bankroll stop: {reason}")
+            return {"markets_scanned": 0, "opportunities": 0, "trades": 0, "skipped": "bankroll_stop"}
 
         # Hourly trade rate check
         cutoff = time.time() - 3600
@@ -2881,10 +3061,22 @@ class EdgeScanner:
             f"best edge={best_edge_str}"
         )
 
-        # Global stats
-        daily_pnl = self.cat_stats.get_daily_pnl()
+        # Global stats + bankroll
         hourly_count = len(self._hourly_trades)
-        lines.append(f"  Daily P&L: ${daily_pnl:+.2f} | Trades/hr: {hourly_count}/{MAX_TRADES_PER_HOUR}")
+        bk = self.bankroll.get_state()
+        if bk["stopped"]:
+            lines.append(
+                f"  Bankroll: STOPPED | P&L=${bk['daily_pnl']:+.2f} | "
+                f"HWM=${bk['hwm']:.2f} | Stop=${bk['stop_level']:+.2f}"
+            )
+        else:
+            lines.append(
+                f"  Bankroll: P&L=${bk['daily_pnl']:+.2f} | "
+                f"HWM=${bk['hwm']:.2f} | Stop=${bk['stop_level']:+.2f} | "
+                f"Tier={bk['tier']} ({bk['contracts']}x) | "
+                f"Bal=${bk['balance']:.2f}"
+            )
+        lines.append(f"  Trades/hr: {hourly_count}/{MAX_TRADES_PER_HOUR}")
 
         # Disabled categories
         if self._disabled_categories:
@@ -2906,13 +3098,17 @@ class EdgeScanner:
         if not self.paper_mode:
             balance = await self.api.connect()
             logger.info(f"Kalshi balance: ${balance:.2f}")
+            self.bankroll.update_balance(balance)
         else:
             # Paper mode: still connect for market data
             try:
                 balance = await self.api.connect()
                 logger.info(f"Kalshi balance: ${balance:.2f} (paper mode — no real trades)")
+                self.bankroll.update_balance(balance)
             except Exception as e:
                 logger.warning(f"Kalshi connection failed (paper mode OK): {e}")
+
+        self.bankroll.write_state_file()
 
         # Backfill unsettled trades from previous sessions
         await self.backfill_unsettled_trades()
@@ -2971,6 +3167,12 @@ class EdgeScanner:
                     await self.check_settlements()
                     await self.check_shadow_settlements()
                     last_settlement_check = time.time()
+                    # Refresh balance for bankroll sizing
+                    if not self.paper_mode:
+                        try:
+                            self.bankroll.update_balance(await self.api.get_balance())
+                        except Exception:
+                            pass  # Balance refresh is best-effort
 
                 # Reconciliation
                 if time.time() - last_reconcile > RECONCILE_INTERVAL_SECONDS:
