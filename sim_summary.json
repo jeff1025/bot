@@ -1,0 +1,32 @@
+{
+  "updated": "2026-02-08T23:42:30Z",
+  "total_trades": 194,
+  "wins": 86,
+  "losses": 108,
+  "win_rate": 44.3,
+  "total_cost": 469.79,
+  "total_payout": 433.0,
+  "total_pnl": -36.79,
+  "avg_edge_pct": 6.3,
+  "pending_trades": 4,
+  "slippage_assumption": 3.0,
+  "sizing": "Kelly 25% (5-25)",
+  "sim_balance": 156.48,
+  "min_edge_pct": 2.0,
+  "venue_stats": {
+    "pm": {
+      "trades": 116,
+      "wins": 52,
+      "losses": 64,
+      "pnl": -34.6,
+      "cost": 297.6
+    },
+    "kalshi": {
+      "trades": 78,
+      "wins": 34,
+      "losses": 44,
+      "pnl": -2.19,
+      "cost": 172.19
+    }
+  }
+}

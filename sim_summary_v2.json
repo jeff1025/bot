@@ -1,0 +1,36 @@
+{
+  "updated": "2026-02-10T00:55:34Z",
+  "strategy": "bell_curve_kelly_v2",
+  "bell_k": 8.0,
+  "vol_dampener": 1.0,
+  "vol_source": "chainlink",
+  "total_trades": 76,
+  "wins": 33,
+  "losses": 43,
+  "win_rate": 43.4,
+  "total_cost": 183.34,
+  "total_payout": 165.0,
+  "total_pnl": -18.34,
+  "avg_edge_pct": 6.83,
+  "pending_trades": 3,
+  "slippage_assumption": 3.0,
+  "sizing": "Kelly 25% \u00d7 bell_conf(k=8.0) (5-25)",
+  "sim_balance": 175.16,
+  "min_edge_pct": 2.0,
+  "venue_stats": {
+    "pm": {
+      "trades": 42,
+      "wins": 18,
+      "losses": 24,
+      "pnl": -16.57,
+      "cost": 106.57
+    },
+    "kalshi": {
+      "trades": 34,
+      "wins": 15,
+      "losses": 19,
+      "pnl": -1.77,
+      "cost": 76.77
+    }
+  }
+}

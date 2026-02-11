@@ -1,0 +1,18 @@
+{
+  "updated": "2026-02-10T01:25:43Z",
+  "venue": "kalshi",
+  "strategy": "scalp",
+  "total_trades": 0,
+  "wins": 0,
+  "losses": 0,
+  "win_rate": 0,
+  "total_cost": 0.0,
+  "total_payout": 0.0,
+  "total_pnl": 0.0,
+  "pending_orders": 0,
+  "pending_settle": 1,
+  "trade_size": "10% Kelly, max 10 contracts, max 3 open",
+  "min_edge_pct": 20.0,
+  "scalp_target": "2.0x fill, min +$0.20",
+  "vol_source": "chainlink"
+}

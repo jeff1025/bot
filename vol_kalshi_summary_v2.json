@@ -1,0 +1,16 @@
+{
+  "updated": "2026-02-11T16:29:44Z",
+  "venue": "kalshi",
+  "total_trades": 27,
+  "wins": 3,
+  "losses": 24,
+  "win_rate": 11.1,
+  "total_cost": 5.19,
+  "total_payout": 3.0,
+  "total_pnl": -2.19,
+  "pending_orders": 0,
+  "pending_settle": 0,
+  "trade_size": "10% Kelly, max 10 contracts, max 3 open",
+  "min_edge_pct": 20.0,
+  "vol_source": "chainlink"
+}
