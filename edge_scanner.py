@@ -1421,7 +1421,7 @@ class MarketScanner:
                         mkt["_event_product_metadata"] = evt.get("product_metadata", {}) or {}
                         markets.append(mkt)
             except Exception as e:
-                logger.debug(f"Scan error for {series}: {e}")
+                logger.warning(f"Scan error for {series}: {e}")
 
         self._last_scan_time[cat_key] = time.time()
         return markets
@@ -1735,8 +1735,9 @@ class EdgeScanner:
 
         # Scan diagnostics (updated each scan, shown on dashboard)
         self._last_scan_diag: dict = {
-            "markets_scanned": 0,
-            "evaluated": 0,
+            "raw_markets": 0,       # markets returned by API
+            "markets_scanned": 0,   # after parsing (time/strike/direction)
+            "evaluated": 0,         # got fair value + orderbook pricing
             "opportunities": 0,
             "best_gross_edge": 0.0,
             "best_ticker": "",
@@ -2209,7 +2210,7 @@ class EdgeScanner:
 
         # Reset scan diagnostics
         self._last_scan_diag = {
-            "markets_scanned": 0, "evaluated": 0, "opportunities": 0,
+            "raw_markets": 0, "markets_scanned": 0, "evaluated": 0, "opportunities": 0,
             "best_gross_edge": 0.0, "best_ticker": "",
             "near_misses": 0, "no_edge": 0, "price_filtered": 0, "time_filtered": 0,
         }
@@ -2235,6 +2236,9 @@ class EdgeScanner:
 
         # 1. Discover markets
         raw_markets = await self.scanner.scan_all()
+        self._last_scan_diag["raw_markets"] = len(raw_markets)
+        if not raw_markets:
+            logger.info("SCAN: 0 raw markets from API (check series tickers / API key / network)")
 
         # 2. Parse and filter
         parsed_markets = []
@@ -2396,10 +2400,10 @@ class EdgeScanner:
         if d["best_ticker"]:
             best_edge_str += f" ({d['best_ticker']})"
         lines.append(
-            f"\n  Last Scan: {d['markets_scanned']} markets | "
+            f"\n  Last Scan: {d['raw_markets']} raw → {d['markets_scanned']} parsed → "
             f"{d['evaluated']} priced | "
             f"{d['near_misses']} near-miss | "
-            f"{d['opportunities']} opportunities | "
+            f"{d['opportunities']} opps | "
             f"best edge={best_edge_str}"
         )
 
