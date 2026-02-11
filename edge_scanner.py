@@ -1491,7 +1491,7 @@ class MarketScanner:
         ticker = raw.get("ticker", "")
         status = raw.get("status", "")
         if status != "open":
-            return self._reject(diag, "status_filtered", ticker)
+            return self._reject(diag, "status_filtered", f"{ticker}[status={status}]")
 
         close_str = raw.get("close_time") or raw.get("expiration_time")
         if not close_str:
