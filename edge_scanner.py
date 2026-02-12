@@ -2279,6 +2279,20 @@ class CalibrationTracker:
         except Exception:
             pass
 
+    def seed_initial_snapshot(self, db: sqlite3.Connection):
+        """Insert an initial snapshot if the table is empty and calibration data exists."""
+        self.compute()
+        if not self._state.get("sufficient"):
+            return
+        try:
+            count = db.execute("SELECT COUNT(*) FROM calibration_snapshots").fetchone()[0]
+            if count > 0:
+                return
+            self._settlements_since_snapshot = 10  # force past threshold
+            self.record_snapshot(db, 0)
+        except Exception as e:
+            logger.debug(f"Calibration seed snapshot error: {e}")
+
     def record_snapshot(self, db: sqlite3.Connection, settled_count: int):
         """Record a calibration snapshot every 10 shadow settlements for history chart."""
         self._settlements_since_snapshot += settled_count
@@ -2587,6 +2601,7 @@ class EdgeScanner:
         self.cat_stats = CategoryStatsTracker(self.db)
         self.bankroll = BankrollManager(self.db)
         self.calibration = CalibrationTracker(self.db)
+        self.calibration.seed_initial_snapshot(self.db)
         self.adaptive_edge = AdaptiveEdgeManager(self.db)
 
         # Connect price feeds to vol tracker

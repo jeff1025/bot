@@ -1029,8 +1029,8 @@ function renderShadowAnalysis(data) {
 function renderCalHistory(data) {
   const history = data.cal_history || [];
   const wrap = document.getElementById('cal-history-wrap');
-  if (wrap) wrap.style.display = history.length < 2 ? 'none' : '';
-  if (history.length < 2) return;
+  if (wrap) wrap.style.display = history.length < 1 ? 'none' : '';
+  if (history.length < 1) return;
 
   const labels = history.map(h => (h.timestamp || '').slice(5, 16).replace('T', ' '));
 
