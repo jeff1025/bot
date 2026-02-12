@@ -153,6 +153,7 @@ SECONDS_PER_YEAR = MINUTES_PER_YEAR * 60
 EWMA_LAMBDA_FAST = 0.90    # Half-life ~7 observations
 EWMA_LAMBDA_SLOW = 0.97    # Half-life ~23 observations
 VOL_DAMPENER = 0.90         # Conservative 10% haircut on vol (fewer but higher-quality trades)
+VOL_RANGE_BOOST = 1.15      # Vol BOOST for ranges (lower vol inflates range FV, so counteract)
 
 MIN_VOL_ABSOLUTE = {        # Safety-net floor (only for data gaps / warmup)
     "BTC": 0.15,
@@ -2195,6 +2196,12 @@ ADAPTIVE_EDGE_FV_BIAS_SLOPE = 0.72      # Additional multiplier per unit distanc
 LOW_FV_PENALTY_THRESHOLD = 0.50
 LOW_FV_PENALTY_MAX_MULT = 10.0
 
+# Time-remaining penalty: more time left = more uncertainty = require more edge
+# Scales linearly from 1.0 near expiry to max at start of trading window
+# Applies to ALL markets; combined with low-FV penalty, makes cheap contracts
+# with lots of time essentially untradeable
+TIME_REMAINING_PENALTY_MAX = 1.5   # 50% more edge at max time remaining
+
 class CalibrationTracker:
     """
     Measures how well the model's fair values predict actual outcomes.
@@ -2539,6 +2546,25 @@ class AdaptiveEdgeManager:
         shortfall = (LOW_FV_PENALTY_THRESHOLD - model_fair) / LOW_FV_PENALTY_THRESHOLD
         return 1.0 + shortfall * (LOW_FV_PENALTY_MAX_MULT - 1.0)
 
+    @staticmethod
+    def _time_remaining_penalty(seconds_left: float, category: str) -> float:
+        """More time remaining = more uncertainty = require more edge.
+
+        Scales linearly from 1.0 near expiry to TIME_REMAINING_PENALTY_MAX
+        at the start of the trading window. Uses per-timeframe bounds.
+
+          hourly 50min → 1.48    hourly 30min → 1.26    hourly 5min → 1.02
+          15min 12min → 1.42     15min 7min → 1.23      15min 2min → 1.02
+        """
+        cfg = CATEGORY_CONFIGS.get(category)
+        tf_key = cfg.timeframe if cfg else "hourly"
+        bounds = ADAPTIVE_EDGE_WINDOW_BOUNDS.get(tf_key, (180, 3300))
+        window_range = bounds[1] - bounds[0]
+        if window_range <= 0:
+            return 1.0
+        frac = max(0.0, min(1.0, (seconds_left - bounds[0]) / window_range))
+        return 1.0 + frac * (TIME_REMAINING_PENALTY_MAX - 1.0)
+
     def get_required_edge(
         self, asset: str, ask_price: float, base_min_edge: float,
         category: str = "", seconds_left: float = 0.0,
@@ -2547,10 +2573,11 @@ class AdaptiveEdgeManager:
         """
         Get the dynamically adjusted edge threshold.
 
-        Combines three factors:
+        Combines four factors:
           1. Learned calibration ratio (per asset × price × time-left bucket)
           2. Fair value confidence bias (structural prior toward 0.50)
-          3. Base min_edge_pct from category config
+          3. Low fair value penalty (cheap contracts need more edge)
+          4. Time-remaining penalty (more time = more uncertainty)
 
         Returns adjusted min_edge_pct, clamped to [FLOOR, CEILING].
         Falls back to base_min_edge * confidence_bias when adaptive data
@@ -2558,9 +2585,10 @@ class AdaptiveEdgeManager:
         """
         fv_bias = self._fair_value_confidence_bias(model_fair)
         low_fv = self._low_fair_value_penalty(model_fair)
+        time_pen = self._time_remaining_penalty(seconds_left, category)
 
         if not self._active:
-            adjusted = base_min_edge * fv_bias * low_fv
+            adjusted = base_min_edge * fv_bias * low_fv * time_pen
             return max(ADAPTIVE_EDGE_FLOOR_PCT, min(ADAPTIVE_EDGE_CEILING_PCT, adjusted))
 
         price_cents = round(ask_price * 100)
@@ -2576,10 +2604,10 @@ class AdaptiveEdgeManager:
         ratio = self._cache.get((asset, price_cents, time_bucket))
         if ratio is None:
             # No learned data at this point — still apply confidence bias
-            adjusted = base_min_edge * fv_bias * low_fv
+            adjusted = base_min_edge * fv_bias * low_fv * time_pen
             return max(ADAPTIVE_EDGE_FLOOR_PCT, min(ADAPTIVE_EDGE_CEILING_PCT, adjusted))
 
-        adjusted = base_min_edge * ratio * fv_bias * low_fv
+        adjusted = base_min_edge * ratio * fv_bias * low_fv * time_pen
         return max(ADAPTIVE_EDGE_FLOOR_PCT, min(ADAPTIVE_EDGE_CEILING_PCT, adjusted))
 
     def get_state(self) -> dict:
@@ -2718,6 +2746,9 @@ class EdgeScanner:
         vol = self.vol_tracker.get_adaptive_vol(asset, seconds_left)
         if not vol:
             return None
+        # Undo dampener + apply range boost: ranges need HIGHER vol
+        # (lower vol = tighter distribution = inflated range FV when spot is in-range)
+        vol = vol / VOL_DAMPENER * VOL_RANGE_BOOST
 
         fair = self.pricer.range_fair_value(spot, floor_strike, cap_strike, seconds_left, vol)
         fair = max(0.001, min(0.999, fair))
