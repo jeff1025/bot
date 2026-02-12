@@ -111,7 +111,7 @@ KALSHI_DEMO_API_BASE = "https://demo-api.kalshi.co/trade-api/v2"
 KALSHI_DEMO_WS_URL = "wss://demo-api.kalshi.co/trade-api/ws/v2"
 
 # ── Scan timing ─────────────────────────────────────────────────────────────
-SCAN_INTERVAL_SECONDS = 15      # Seconds between full market scans
+SCAN_INTERVAL_SECONDS = 5       # Seconds between full market scans (must be < window width)
 RECONCILE_INTERVAL_SECONDS = 120  # Seconds between position reconciliation checks
 SETTLEMENT_CHECK_INTERVAL = 30  # Seconds between settlement checks
 STATS_PRINT_INTERVAL = 60       # Seconds between dashboard prints
