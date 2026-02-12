@@ -2773,10 +2773,10 @@ class EdgeScanner:
             return self._fair_value_vol_bs(asset, strike, seconds_left, direction)
 
         if config.fair_value_model == "vol_bs_range":
-            if cap_strike is None:
-                logger.warning(f"Range model requires cap_strike for {category}")
-                return None
-            return self._fair_value_vol_bs_range(asset, strike, cap_strike, seconds_left)
+            if cap_strike is not None:
+                return self._fair_value_vol_bs_range(asset, strike, cap_strike, seconds_left)
+            # Non-range market in a range category — fall back to vol_bs
+            return self._fair_value_vol_bs(asset, strike, seconds_left, direction)
 
         logger.warning(f"Unknown fair value model: {config.fair_value_model}")
         return None
