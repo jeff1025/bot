@@ -43,8 +43,8 @@ CATEGORIES = [
     ("crypto_15min_eth", "15min ETH", "#627eea"),
     ("crypto_15min_sol", "15min SOL", "#9945ff"),
     ("crypto_15min_xrp", "15min XRP", "#23292f"),
-    ("crypto_daily_xrp", "Daily XRP", "#23292f"),
-    ("crypto_range_doge", "Range DOGE", "#c2a633"),
+    ("crypto_hourly_xrp", "Hourly XRP", "#23292f"),
+    ("crypto_hourly_doge", "Hourly DOGE", "#c2a633"),
 ]
 
 
@@ -451,8 +451,8 @@ const CATS = [
   {key: "crypto_15min_eth",  label: "15min ETH",  color: "#627eea"},
   {key: "crypto_15min_sol",  label: "15min SOL",  color: "#9945ff"},
   {key: "crypto_15min_xrp",  label: "15min XRP",  color: "#23292f"},
-  {key: "crypto_daily_xrp",  label: "Daily XRP",  color: "#23292f"},
-  {key: "crypto_range_doge", label: "Range DOGE", color: "#c2a633"},
+  {key: "crypto_hourly_xrp",  label: "Hourly XRP",  color: "#23292f"},
+  {key: "crypto_hourly_doge", label: "Hourly DOGE", color: "#c2a633"},
 ];
 
 let charts = {};

@@ -357,18 +357,18 @@ CATEGORY_CONFIGS = {
         min_trades_for_breaker=20,
         min_win_rate=0.30,
     ),
-    "crypto_daily_xrp": CategoryConfig(
-        name="Crypto Daily XRP",
+    "crypto_hourly_xrp": CategoryConfig(
+        name="Crypto Hourly XRP",
         enabled=True,
-        series_tickers=["KXXRPD"],
-        timeframe="daily",
-        fair_value_model="vol_bs",
+        series_tickers=["KXXRP"],
+        timeframe="hourly",
+        fair_value_model="vol_bs_range",
         min_edge_pct=25.0,
         max_edge_pct=60.0,
         max_price=0.75,
         min_price=0.02,
-        min_seconds_to_expiry=300,
-        max_seconds_to_expiry=14400,     # Trade within 4 hours of settlement
+        min_seconds_to_expiry=180,
+        max_seconds_to_expiry=3300,
         max_positions_per_category=2,
         max_positions_per_event=2,
         contracts_per_trade=1,
@@ -376,19 +376,19 @@ CATEGORY_CONFIGS = {
         min_trades_for_breaker=20,
         min_win_rate=0.30,
     ),
-    # ── DOGE range markets ─────────────────────────────────────────────────
-    "crypto_range_doge": CategoryConfig(
-        name="Crypto Range DOGE",
+    # ── DOGE hourly range markets ──────────────────────────────────────────
+    "crypto_hourly_doge": CategoryConfig(
+        name="Crypto Hourly DOGE",
         enabled=True,
         series_tickers=["KXDOGE"],
-        timeframe="daily",
+        timeframe="hourly",
         fair_value_model="vol_bs_range",
         min_edge_pct=25.0,
         max_edge_pct=60.0,
         max_price=0.75,
         min_price=0.02,
-        min_seconds_to_expiry=300,
-        max_seconds_to_expiry=14400,     # Trade within 4 hours of settlement
+        min_seconds_to_expiry=180,
+        max_seconds_to_expiry=3300,
         max_positions_per_category=2,
         max_positions_per_event=2,
         contracts_per_trade=1,
