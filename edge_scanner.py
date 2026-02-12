@@ -2162,7 +2162,6 @@ CALIBRATION_MIN_SAMPLES = 20  # Don't report metrics until this many shadow sett
 ADAPTIVE_EDGE_PRICE_BANDWIDTH = 0.03    # Gaussian kernel bandwidth in dollars ($0.03)
 ADAPTIVE_EDGE_MIN_WEIGHT = 3.0          # Minimum effective sample weight to produce adjustment
 ADAPTIVE_EDGE_FLOOR_PCT = 15.0          # Hard floor: never require less edge than this
-ADAPTIVE_EDGE_CEILING_PCT = 58.0        # Hard ceiling: 58% vs max_edge 60% = narrow 2% window for cheap contracts
 ADAPTIVE_EDGE_MIN_SAMPLES = 30          # Don't activate until this many settled shadow trades
 
 # Per-timeframe recency half-lives (hours): faster markets forget faster
@@ -2180,27 +2179,14 @@ ADAPTIVE_EDGE_WINDOW_BOUNDS = {           # (min_sec, max_sec) per timeframe
     "hourly": (180, 3300),
 }
 
-# Fair value confidence bias: model is more accurate near 0.50, less at extremes
-# Multiplier: < 1.0 near 0.50 (relax edge), > 1.0 at extremes (tighten)
-# Aggressive center discount justified by calibration: 67% actual WR in 50-65% zone
-# vs ~57.5% predicted (n=39). Fee diff negligible ($0.02 cap). Crossover at fair=0.75.
-ADAPTIVE_EDGE_FV_BIAS_CENTER = 0.82     # Multiplier at fair=0.50 (18% discount)
-ADAPTIVE_EDGE_FV_BIAS_SLOPE = 0.72      # Additional multiplier per unit distance from 0.50
-
-# Low fair value penalty: cheap contracts (fair < 0.50) need much more edge
-# Multiplier escalates linearly from 1.0 at fair=0.50 to 10.0 at fair→0
-# Creates a steep wall: fair=0.45 needs ~41% edge, fair=0.43 needs ~49%,
-# fair=0.40 hits the 58% ceiling (only 58-60% edge window passes, vs max_edge 60%)
-# Avg edges run 40-57%, so this effectively enforces fair >= ~0.45 for normal trades
-# with a narrow escape hatch at 58-60% edge for truly insane mispricing below that
-LOW_FV_PENALTY_THRESHOLD = 0.50
-LOW_FV_PENALTY_MAX_MULT = 10.0
-
-# Time-remaining penalty: more time left = more uncertainty = require more edge
-# Scales linearly from 1.0 near expiry to max at start of trading window
-# Applies to ALL markets; combined with low-FV penalty, makes cheap contracts
-# with lots of time essentially untradeable
-TIME_REMAINING_PENALTY_MAX = 1.5   # 50% more edge at max time remaining
+# Calibration-driven edge: per-FV-bucket breakeven edge from actual win rates
+# Same buckets as dashboard calibration chart
+CALIBRATION_BUCKETS = [
+    (0.05, 0.20), (0.20, 0.30), (0.30, 0.40), (0.40, 0.50),
+    (0.50, 0.60), (0.60, 0.70), (0.70, 0.80), (0.80, 0.95),
+]
+CALIBRATION_BUCKET_MIN_N = 10    # Need ≥10 settled samples to trust a bucket
+CALIBRATION_PROFIT_MARGIN = 10.0 # % margin on top of breakeven edge (fees + variance + profit)
 
 class CalibrationTracker:
     """
@@ -2295,6 +2281,55 @@ class CalibrationTracker:
             return f"Overconfidence {oc:.2f}x — model predicting {self._state['predicted_wr']:.0f}% but actual {self._state['actual_wr']:.0f}%"
         return None
 
+    def compute_bucket_calibration(self, lookback_days: int = 7):
+        """Compute per-FV-bucket actual win rates from settled shadow trades.
+
+        Populates _bucket_wr: dict mapping (lo, hi) → actual_wr for buckets
+        with sufficient samples (n >= CALIBRATION_BUCKET_MIN_N).
+        """
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=lookback_days)).isoformat()
+        rows = self.db.execute(
+            """
+            SELECT model_fair, won
+            FROM shadow_trades
+            WHERE settled=1 AND settlement_result IN ('yes', 'no')
+            AND settled_at > ?
+            """,
+            (cutoff,),
+        ).fetchall()
+
+        self._bucket_wr = {}
+        for lo, hi in CALIBRATION_BUCKETS:
+            bucket_rows = [(mf, w) for mf, w in rows if lo <= mf < hi]
+            n = len(bucket_rows)
+            if n >= CALIBRATION_BUCKET_MIN_N:
+                wins = sum(1 for _, w in bucket_rows if w)
+                self._bucket_wr[(lo, hi)] = wins / n
+
+    def get_calibrated_min_edge(self, model_fair: float) -> Optional[float]:
+        """Data-driven min edge from actual win rates per FV bucket.
+
+        Returns breakeven edge + profit margin, or None if insufficient
+        calibration data for this bucket (caller uses fallback).
+
+        Formula: breakeven = (1 - actual_wr / model_fair) × 100
+        A 40-50% bucket with 30% actual WR at model_fair=0.45:
+          breakeven = (1 - 0.30/0.45) × 100 = 33.3%, + 10% margin = 43.3%
+        """
+        if not hasattr(self, '_bucket_wr') or not self._bucket_wr:
+            return None
+
+        # Find the bucket for this model_fair
+        for lo, hi in CALIBRATION_BUCKETS:
+            if lo <= model_fair < hi:
+                actual_wr = self._bucket_wr.get((lo, hi))
+                if actual_wr is None:
+                    return None  # Insufficient data for this bucket
+                breakeven = max(0.0, (1.0 - actual_wr / model_fair) * 100.0)
+                return breakeven + CALIBRATION_PROFIT_MARGIN
+
+        return None  # model_fair outside all buckets
+
     def get_state(self) -> dict:
         return dict(self._state)
 
@@ -2310,6 +2345,7 @@ class CalibrationTracker:
     def seed_initial_snapshot(self, db: sqlite3.Connection):
         """Insert an initial snapshot if the table is empty and calibration data exists."""
         self.compute()
+        self.compute_bucket_calibration()
         if not self._state.get("sufficient"):
             return
         try:
@@ -2380,8 +2416,9 @@ class AdaptiveEdgeManager:
       - ratio < 1  → model underconfident → require LESS edge (within bounds)
     """
 
-    def __init__(self, db: sqlite3.Connection):
+    def __init__(self, db: sqlite3.Connection, calibration: 'CalibrationTracker' = None):
         self.db = db
+        self._calibration = calibration
         self._cache: dict = {}       # (asset, price_cents, time_bucket) -> calibration_ratio
         self._active: bool = False
         self._last_refresh: float = 0
@@ -2522,93 +2559,45 @@ class AdaptiveEdgeManager:
             "total_price_points": len(new_cache),
         }
 
-    @staticmethod
-    def _fair_value_confidence_bias(model_fair: float) -> float:
-        """Structural prior: model is more accurate near fair=0.50.
-
-        Returns multiplier < 1.0 near 0.50 (relax edge threshold) and
-        > 1.0 at extremes (tighten). Conservative near-50 discount because
-        fees peak at P=0.50.
-        """
-        distance = abs(model_fair - 0.50)
-        return ADAPTIVE_EDGE_FV_BIAS_CENTER + distance * ADAPTIVE_EDGE_FV_BIAS_SLOPE
-
-    @staticmethod
-    def _low_fair_value_penalty(model_fair: float) -> float:
-        """Cheap contract penalty: escalating edge multiplier when fair < 0.50.
-
-        Returns 1.0 when fair >= 0.50. Scales steeply below:
-          fair=0.48 → 1.36    fair=0.45 → 1.90    fair=0.43 → 2.26
-          fair=0.40 → 2.80    fair=0.35 → 3.70    fair=0.30 → 4.60
-        """
-        if model_fair >= LOW_FV_PENALTY_THRESHOLD:
-            return 1.0
-        shortfall = (LOW_FV_PENALTY_THRESHOLD - model_fair) / LOW_FV_PENALTY_THRESHOLD
-        return 1.0 + shortfall * (LOW_FV_PENALTY_MAX_MULT - 1.0)
-
-    @staticmethod
-    def _time_remaining_penalty(seconds_left: float, category: str) -> float:
-        """More time remaining = more uncertainty = require more edge.
-
-        Scales linearly from 1.0 near expiry to TIME_REMAINING_PENALTY_MAX
-        at the start of the trading window. Uses per-timeframe bounds.
-
-          hourly 50min → 1.48    hourly 30min → 1.26    hourly 5min → 1.02
-          15min 12min → 1.42     15min 7min → 1.23      15min 2min → 1.02
-        """
-        cfg = CATEGORY_CONFIGS.get(category)
-        tf_key = cfg.timeframe if cfg else "hourly"
-        bounds = ADAPTIVE_EDGE_WINDOW_BOUNDS.get(tf_key, (180, 3300))
-        window_range = bounds[1] - bounds[0]
-        if window_range <= 0:
-            return 1.0
-        frac = max(0.0, min(1.0, (seconds_left - bounds[0]) / window_range))
-        return 1.0 + frac * (TIME_REMAINING_PENALTY_MAX - 1.0)
-
     def get_required_edge(
         self, asset: str, ask_price: float, base_min_edge: float,
         category: str = "", seconds_left: float = 0.0,
         model_fair: float = 0.5,
     ) -> float:
         """
-        Get the dynamically adjusted edge threshold.
+        Data-driven edge threshold from calibration win rates.
 
-        Combines four factors:
-          1. Learned calibration ratio (per asset × price × time-left bucket)
-          2. Fair value confidence bias (structural prior toward 0.50)
-          3. Low fair value penalty (cheap contracts need more edge)
-          4. Time-remaining penalty (more time = more uncertainty)
+        Priority:
+          1. Calibrated breakeven edge (from actual WR per FV bucket) + profit margin
+          2. Adaptive kernel ratio (per asset × price × time fine-tuning)
+          3. Falls back to base_min_edge when calibration data insufficient
 
-        Returns adjusted min_edge_pct, clamped to [FLOOR, CEILING].
-        Falls back to base_min_edge * confidence_bias when adaptive data
-        is insufficient at this point.
+        No ceiling — if calibration says 80% edge needed, require 80%.
+        The max_edge_pct filter handles blocking impossibly-demanding buckets.
         """
-        fv_bias = self._fair_value_confidence_bias(model_fair)
-        low_fv = self._low_fair_value_penalty(model_fair)
-        time_pen = self._time_remaining_penalty(seconds_left, category)
+        # Step 1: calibration-based minimum edge from actual win rates
+        effective_base = base_min_edge
+        if self._calibration:
+            cal_edge = self._calibration.get_calibrated_min_edge(model_fair)
+            if cal_edge is not None:
+                effective_base = cal_edge
 
-        if not self._active:
-            adjusted = base_min_edge * fv_bias * low_fv * time_pen
-            return max(ADAPTIVE_EDGE_FLOOR_PCT, min(ADAPTIVE_EDGE_CEILING_PCT, adjusted))
+        # Step 2: adaptive kernel ratio (asset/price/time learned adjustment)
+        if self._active:
+            price_cents = round(ask_price * 100)
 
-        price_cents = round(ask_price * 100)
+            time_bucket = ADAPTIVE_EDGE_TIME_BUCKETS // 2
+            if category:
+                cfg = CATEGORY_CONFIGS.get(category)
+                tf_key = cfg.timeframe if cfg else "hourly"
+                frac = self._normalize_seconds_left(seconds_left, tf_key)
+                time_bucket = self._seconds_left_to_bucket(frac)
 
-        # Compute time-left bucket from seconds_left + category timeframe
-        time_bucket = ADAPTIVE_EDGE_TIME_BUCKETS // 2  # default: middle
-        if category:
-            cfg = CATEGORY_CONFIGS.get(category)
-            tf_key = cfg.timeframe if cfg else "hourly"
-            frac = self._normalize_seconds_left(seconds_left, tf_key)
-            time_bucket = self._seconds_left_to_bucket(frac)
+            ratio = self._cache.get((asset, price_cents, time_bucket))
+            if ratio is not None:
+                effective_base *= ratio
 
-        ratio = self._cache.get((asset, price_cents, time_bucket))
-        if ratio is None:
-            # No learned data at this point — still apply confidence bias
-            adjusted = base_min_edge * fv_bias * low_fv * time_pen
-            return max(ADAPTIVE_EDGE_FLOOR_PCT, min(ADAPTIVE_EDGE_CEILING_PCT, adjusted))
-
-        adjusted = base_min_edge * ratio * fv_bias * low_fv * time_pen
-        return max(ADAPTIVE_EDGE_FLOOR_PCT, min(ADAPTIVE_EDGE_CEILING_PCT, adjusted))
+        return max(ADAPTIVE_EDGE_FLOOR_PCT, effective_base)
 
     def get_state(self) -> dict:
         return dict(self._stats)
@@ -2665,7 +2654,7 @@ class EdgeScanner:
         self.bankroll = BankrollManager(self.db)
         self.calibration = CalibrationTracker(self.db)
         self.calibration.seed_initial_snapshot(self.db)
-        self.adaptive_edge = AdaptiveEdgeManager(self.db)
+        self.adaptive_edge = AdaptiveEdgeManager(self.db, calibration=self.calibration)
 
         # Connect price feeds to vol tracker
         self.chainlink.on_price(self.vol_tracker.feed_price)
@@ -3501,6 +3490,7 @@ class EdgeScanner:
             logger.info(f"SHADOW: Settled {settled_count} shadow trades")
             # Update calibration metrics after new settlements
             self.calibration.compute()
+            self.calibration.compute_bucket_calibration()
             self.calibration.write_state_file()
             self.calibration.record_snapshot(self.db, settled_count)
             warn = self.calibration.should_warn()
