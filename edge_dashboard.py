@@ -938,10 +938,12 @@ function renderShadowAnalysis(data) {
   // 1. Calibration chart: model fair value buckets vs actual win rate
   const calBuckets = [
     {lo: 0.05, hi: 0.20, label: '5-20%'},
-    {lo: 0.20, hi: 0.35, label: '20-35%'},
-    {lo: 0.35, hi: 0.50, label: '35-50%'},
-    {lo: 0.50, hi: 0.65, label: '50-65%'},
-    {lo: 0.65, hi: 0.80, label: '65-80%'},
+    {lo: 0.20, hi: 0.30, label: '20-30%'},
+    {lo: 0.30, hi: 0.40, label: '30-40%'},
+    {lo: 0.40, hi: 0.50, label: '40-50%'},
+    {lo: 0.50, hi: 0.60, label: '50-60%'},
+    {lo: 0.60, hi: 0.70, label: '60-70%'},
+    {lo: 0.70, hi: 0.80, label: '70-80%'},
     {lo: 0.80, hi: 0.95, label: '80-95%'},
   ];
   const calLabels = [];

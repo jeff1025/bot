@@ -2170,9 +2170,10 @@ ADAPTIVE_EDGE_WINDOW_BOUNDS = {           # (min_sec, max_sec) per timeframe
 
 # Fair value confidence bias: model is more accurate near 0.50, less at extremes
 # Multiplier: < 1.0 near 0.50 (relax edge), > 1.0 at extremes (tighten)
-# Conservative center discount (0.92 not 0.80) because fees peak at P=0.50
-ADAPTIVE_EDGE_FV_BIAS_CENTER = 0.92     # Multiplier at fair=0.50 (8% discount)
-ADAPTIVE_EDGE_FV_BIAS_SLOPE = 0.40      # Additional multiplier per unit distance from 0.50
+# Aggressive center discount justified by calibration: 67% actual WR in 50-65% zone
+# vs ~57.5% predicted (n=39). Fee diff negligible ($0.02 cap). Crossover at fair=0.75.
+ADAPTIVE_EDGE_FV_BIAS_CENTER = 0.82     # Multiplier at fair=0.50 (18% discount)
+ADAPTIVE_EDGE_FV_BIAS_SLOPE = 0.72      # Additional multiplier per unit distance from 0.50
 
 class CalibrationTracker:
     """
