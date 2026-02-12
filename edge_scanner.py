@@ -2129,12 +2129,32 @@ class BankrollManager:
 CALIBRATION_MIN_SAMPLES = 20  # Don't report metrics until this many shadow settlements
 
 # ── Adaptive edge thresholds (dynamic per-price-level edge requirements) ──
-ADAPTIVE_EDGE_HALF_LIFE_HOURS = 48.0    # Recency decay: trades from 48h ago get 50% weight
 ADAPTIVE_EDGE_PRICE_BANDWIDTH = 0.03    # Gaussian kernel bandwidth in dollars ($0.03)
 ADAPTIVE_EDGE_MIN_WEIGHT = 3.0          # Minimum effective sample weight to produce adjustment
 ADAPTIVE_EDGE_FLOOR_PCT = 15.0          # Hard floor: never require less edge than this
 ADAPTIVE_EDGE_CEILING_PCT = 45.0        # Hard ceiling: never require more edge than this
 ADAPTIVE_EDGE_MIN_SAMPLES = 30          # Don't activate until this many settled shadow trades
+
+# Per-timeframe recency half-lives (hours): faster markets forget faster
+ADAPTIVE_EDGE_HALF_LIFE_BY_TIMEFRAME = {
+    "15min": 12.0,    # 15-min markets cycle 4x faster → 4x shorter memory
+    "hourly": 48.0,   # Hourly markets: standard 2-day half-life
+}
+ADAPTIVE_EDGE_HALF_LIFE_DEFAULT = 48.0  # Fallback for unknown timeframes
+
+# seconds_left kernel (normalized to [0,1] fraction of trading window)
+ADAPTIVE_EDGE_TIME_LEFT_BANDWIDTH = 0.15  # Gaussian bandwidth in normalized units
+ADAPTIVE_EDGE_TIME_BUCKETS = 5            # Cache discretization buckets
+ADAPTIVE_EDGE_WINDOW_BOUNDS = {           # (min_sec, max_sec) per timeframe
+    "15min": (90, 840),
+    "hourly": (180, 3300),
+}
+
+# Fair value confidence bias: model is more accurate near 0.50, less at extremes
+# Multiplier: < 1.0 near 0.50 (relax edge), > 1.0 at extremes (tighten)
+# Conservative center discount (0.92 not 0.80) because fees peak at P=0.50
+ADAPTIVE_EDGE_FV_BIAS_CENTER = 0.92     # Multiplier at fair=0.50 (8% discount)
+ADAPTIVE_EDGE_FV_BIAS_SLOPE = 0.40      # Additional multiplier per unit distance from 0.50
 
 class CalibrationTracker:
     """
@@ -2264,16 +2284,34 @@ class AdaptiveEdgeManager:
 
     def __init__(self, db: sqlite3.Connection):
         self.db = db
-        self._cache: dict = {}       # (asset, price_cents) -> calibration_ratio
+        self._cache: dict = {}       # (asset, price_cents, time_bucket) -> calibration_ratio
         self._active: bool = False
         self._last_refresh: float = 0
         self._stats: dict = {}
 
+    @staticmethod
+    def _normalize_seconds_left(seconds_left: float, timeframe: str) -> float:
+        """Normalize seconds_left to [0, 1] fraction of the trading window."""
+        bounds = ADAPTIVE_EDGE_WINDOW_BOUNDS.get(timeframe, (180, 3300))
+        window_range = bounds[1] - bounds[0]
+        if window_range <= 0:
+            return 0.5
+        return max(0.0, min(1.0, (seconds_left - bounds[0]) / window_range))
+
+    @staticmethod
+    def _seconds_left_to_bucket(frac: float) -> int:
+        """Convert normalized fraction to cache bucket index."""
+        return min(ADAPTIVE_EDGE_TIME_BUCKETS - 1, int(frac * ADAPTIVE_EDGE_TIME_BUCKETS))
+
     def refresh(self):
-        """Recompute the adaptive edge surface from shadow trade history."""
+        """Recompute the adaptive edge surface from shadow trade history.
+
+        Three-dimensional kernel: recency (per-timeframe half-life) ×
+        price (Gaussian) × time-left (Gaussian on normalized window fraction).
+        """
         rows = self.db.execute(
             """
-            SELECT asset, ask_price, model_fair, won, settled_at
+            SELECT asset, ask_price, model_fair, won, settled_at, category, seconds_left
             FROM shadow_trades
             WHERE settled=1 AND settlement_result IN ('yes', 'no')
             """
@@ -2288,70 +2326,80 @@ class AdaptiveEdgeManager:
         now = datetime.now(timezone.utc)
         ln2 = math.log(2)
 
-        # Parse rows and compute recency weights
+        # Build category -> timeframe lookup
+        cat_to_tf: dict = {}
+        for cat_key, cfg in CATEGORY_CONFIGS.items():
+            cat_to_tf[cat_key] = cfg.timeframe
+
+        # Parse rows with per-timeframe recency weight and normalized time fraction
         trades = []
-        for asset, ask_price, model_fair, won, settled_at in rows:
+        for asset, ask_price, model_fair, won, settled_at, category, secs_left in rows:
             try:
                 settled_dt = datetime.fromisoformat(settled_at)
                 if settled_dt.tzinfo is None:
                     settled_dt = settled_dt.replace(tzinfo=timezone.utc)
                 age_hours = max(0.0, (now - settled_dt).total_seconds() / 3600)
             except Exception:
-                age_hours = 168.0  # Fallback to 1 week
-            recency_w = math.exp(-age_hours / ADAPTIVE_EDGE_HALF_LIFE_HOURS * ln2)
-            trades.append((asset, ask_price, model_fair, won or 0, recency_w))
+                age_hours = 168.0
+
+            timeframe = cat_to_tf.get(category, "hourly")
+            half_life = ADAPTIVE_EDGE_HALF_LIFE_BY_TIMEFRAME.get(
+                timeframe, ADAPTIVE_EDGE_HALF_LIFE_DEFAULT
+            )
+            recency_w = math.exp(-age_hours / half_life * ln2)
+            frac = self._normalize_seconds_left(secs_left, timeframe)
+            trades.append((asset, ask_price, model_fair, won or 0, recency_w, frac))
 
         # Group by asset
         assets: dict = {}
-        for asset, price, fair, won, rw in trades:
+        for asset, price, fair, won, rw, frac in trades:
             if asset not in assets:
                 assets[asset] = []
-            assets[asset].append((price, fair, won, rw))
+            assets[asset].append((price, fair, won, rw, frac))
 
-        bw_sq_2 = 2.0 * ADAPTIVE_EDGE_PRICE_BANDWIDTH ** 2
+        price_bw_sq_2 = 2.0 * ADAPTIVE_EDGE_PRICE_BANDWIDTH ** 2
+        tl_bw_sq_2 = 2.0 * ADAPTIVE_EDGE_TIME_LEFT_BANDWIDTH ** 2
         new_cache: dict = {}
-        adjustments_log: dict = {}  # asset -> list of (price, ratio) for stats
+        adjustments_log: dict = {}
 
         for asset, asset_trades in assets.items():
             adjustments_log[asset] = []
 
-            # Evaluate at each penny from $0.02 to $0.75
             for price_cents in range(2, 76):
                 target_price = price_cents / 100.0
 
-                weighted_wins = 0.0
-                weighted_total = 0.0
-                weighted_pred_sum = 0.0
+                for time_bucket in range(ADAPTIVE_EDGE_TIME_BUCKETS):
+                    target_frac = (time_bucket + 0.5) / ADAPTIVE_EDGE_TIME_BUCKETS
 
-                for price, fair, won, rw in asset_trades:
-                    price_diff = price - target_price
-                    price_w = math.exp(-(price_diff ** 2) / bw_sq_2)
-                    combined_w = rw * price_w
+                    weighted_wins = 0.0
+                    weighted_total = 0.0
+                    weighted_pred_sum = 0.0
 
-                    weighted_wins += won * combined_w
-                    weighted_total += combined_w
-                    weighted_pred_sum += fair * combined_w
+                    for price, fair, won, rw, frac in asset_trades:
+                        price_w = math.exp(-((price - target_price) ** 2) / price_bw_sq_2)
+                        tl_w = math.exp(-((frac - target_frac) ** 2) / tl_bw_sq_2)
+                        combined_w = rw * price_w * tl_w
 
-                if weighted_total < ADAPTIVE_EDGE_MIN_WEIGHT:
-                    continue  # Not enough data at this price point
+                        weighted_wins += won * combined_w
+                        weighted_total += combined_w
+                        weighted_pred_sum += fair * combined_w
 
-                actual_wr = weighted_wins / weighted_total
-                predicted_wr = weighted_pred_sum / weighted_total
+                    if weighted_total < ADAPTIVE_EDGE_MIN_WEIGHT:
+                        continue
 
-                # Calibration ratio
-                if actual_wr > 0.05:
-                    ratio = predicted_wr / actual_wr
-                elif actual_wr > 0.01:
-                    # Very low actual WR — cap ratio to avoid extreme values
-                    ratio = min(2.0, predicted_wr / actual_wr)
-                else:
-                    # Near-zero wins: model badly overconfident at this price
-                    ratio = 2.0
+                    actual_wr = weighted_wins / weighted_total
+                    predicted_wr = weighted_pred_sum / weighted_total
 
-                # Clamp ratio to prevent runaway feedback
-                ratio = max(0.6, min(2.0, ratio))
-                new_cache[(asset, price_cents)] = ratio
-                adjustments_log[asset].append((price_cents, ratio))
+                    if actual_wr > 0.05:
+                        ratio = predicted_wr / actual_wr
+                    elif actual_wr > 0.01:
+                        ratio = min(2.0, predicted_wr / actual_wr)
+                    else:
+                        ratio = 2.0
+
+                    ratio = max(0.6, min(2.0, ratio))
+                    new_cache[(asset, price_cents, time_bucket)] = ratio
+                    adjustments_log[asset].append((price_cents, time_bucket, ratio))
 
         self._cache = new_cache
         self._active = True
@@ -2362,7 +2410,7 @@ class AdaptiveEdgeManager:
         for asset, adjustments in adjustments_log.items():
             if not adjustments:
                 continue
-            ratios = [r for _, r in adjustments]
+            ratios = [r for _, _, r in adjustments]
             asset_summaries[asset] = {
                 "price_points": len(adjustments),
                 "avg_ratio": round(sum(ratios) / len(ratios), 3),
@@ -2376,22 +2424,57 @@ class AdaptiveEdgeManager:
             "total_price_points": len(new_cache),
         }
 
-    def get_required_edge(self, asset: str, ask_price: float, base_min_edge: float) -> float:
+    @staticmethod
+    def _fair_value_confidence_bias(model_fair: float) -> float:
+        """Structural prior: model is more accurate near fair=0.50.
+
+        Returns multiplier < 1.0 near 0.50 (relax edge threshold) and
+        > 1.0 at extremes (tighten). Conservative near-50 discount because
+        fees peak at P=0.50.
         """
-        Get the dynamically adjusted edge threshold for a specific asset and price.
+        distance = abs(model_fair - 0.50)
+        return ADAPTIVE_EDGE_FV_BIAS_CENTER + distance * ADAPTIVE_EDGE_FV_BIAS_SLOPE
+
+    def get_required_edge(
+        self, asset: str, ask_price: float, base_min_edge: float,
+        category: str = "", seconds_left: float = 0.0,
+        model_fair: float = 0.5,
+    ) -> float:
+        """
+        Get the dynamically adjusted edge threshold.
+
+        Combines three factors:
+          1. Learned calibration ratio (per asset × price × time-left bucket)
+          2. Fair value confidence bias (structural prior toward 0.50)
+          3. Base min_edge_pct from category config
 
         Returns adjusted min_edge_pct, clamped to [FLOOR, CEILING].
-        Falls back to base_min_edge when adaptive data is insufficient.
+        Falls back to base_min_edge * confidence_bias when adaptive data
+        is insufficient at this point.
         """
+        fv_bias = self._fair_value_confidence_bias(model_fair)
+
         if not self._active:
-            return base_min_edge
+            adjusted = base_min_edge * fv_bias
+            return max(ADAPTIVE_EDGE_FLOOR_PCT, min(ADAPTIVE_EDGE_CEILING_PCT, adjusted))
 
         price_cents = round(ask_price * 100)
-        ratio = self._cache.get((asset, price_cents))
-        if ratio is None:
-            return base_min_edge
 
-        adjusted = base_min_edge * ratio
+        # Compute time-left bucket from seconds_left + category timeframe
+        time_bucket = ADAPTIVE_EDGE_TIME_BUCKETS // 2  # default: middle
+        if category:
+            cfg = CATEGORY_CONFIGS.get(category)
+            tf_key = cfg.timeframe if cfg else "hourly"
+            frac = self._normalize_seconds_left(seconds_left, tf_key)
+            time_bucket = self._seconds_left_to_bucket(frac)
+
+        ratio = self._cache.get((asset, price_cents, time_bucket))
+        if ratio is None:
+            # No learned data at this point — still apply confidence bias
+            adjusted = base_min_edge * fv_bias
+            return max(ADAPTIVE_EDGE_FLOOR_PCT, min(ADAPTIVE_EDGE_CEILING_PCT, adjusted))
+
+        adjusted = base_min_edge * ratio * fv_bias
         return max(ADAPTIVE_EDGE_FLOOR_PCT, min(ADAPTIVE_EDGE_CEILING_PCT, adjusted))
 
     def get_state(self) -> dict:
@@ -2401,12 +2484,12 @@ class AdaptiveEdgeManager:
         """Write adaptive edge state to JSON for the web dashboard."""
         try:
             state_path = os.path.join(LOG_DIR, "adaptive_edge_state.json")
-            # Include sample of actual thresholds for inspection
+            # Include thresholds grouped by asset, keyed as "$0.XX_tN"
             sample_thresholds = {}
-            for (asset, pc), ratio in sorted(self._cache.items()):
+            for (asset, pc, tb), ratio in sorted(self._cache.items()):
                 if asset not in sample_thresholds:
                     sample_thresholds[asset] = {}
-                sample_thresholds[asset][f"${pc/100:.2f}"] = round(ratio, 3)
+                sample_thresholds[asset][f"${pc/100:.2f}_t{tb}"] = round(ratio, 3)
 
             state = {**self._stats, "thresholds": sample_thresholds}
             with open(state_path, "w") as f:
@@ -2684,7 +2767,8 @@ class EdgeScanner:
 
         # Edge filters — use adaptive threshold when available
         required_edge = self.adaptive_edge.get_required_edge(
-            asset, ask_price, config.min_edge_pct
+            asset, ask_price, config.min_edge_pct,
+            category=category, seconds_left=seconds_left, model_fair=fair,
         )
         if gross_edge_pct < required_edge:
             if gross_edge_pct > 0:
@@ -2743,7 +2827,9 @@ class EdgeScanner:
         # Pre-execution logging
         config = CATEGORY_CONFIGS.get(opp.category)
         req_edge = self.adaptive_edge.get_required_edge(
-            opp.asset, opp.ask_price, config.min_edge_pct if config else 25.0
+            opp.asset, opp.ask_price, config.min_edge_pct if config else 25.0,
+            category=opp.category, seconds_left=opp.seconds_left,
+            model_fair=opp.model_fair,
         )
         logger.info(
             f"{'[PAPER] ' if self.paper_mode else ''}"
