@@ -2161,7 +2161,7 @@ CALIBRATION_MIN_SAMPLES = 20  # Don't report metrics until this many shadow sett
 ADAPTIVE_EDGE_PRICE_BANDWIDTH = 0.03    # Gaussian kernel bandwidth in dollars ($0.03)
 ADAPTIVE_EDGE_MIN_WEIGHT = 3.0          # Minimum effective sample weight to produce adjustment
 ADAPTIVE_EDGE_FLOOR_PCT = 15.0          # Hard floor: never require less edge than this
-ADAPTIVE_EDGE_CEILING_PCT = 55.0        # Hard ceiling: raised to allow low-FV penalty room
+ADAPTIVE_EDGE_CEILING_PCT = 58.0        # Hard ceiling: 58% vs max_edge 60% = narrow 2% window for cheap contracts
 ADAPTIVE_EDGE_MIN_SAMPLES = 30          # Don't activate until this many settled shadow trades
 
 # Per-timeframe recency half-lives (hours): faster markets forget faster
@@ -2187,12 +2187,13 @@ ADAPTIVE_EDGE_FV_BIAS_CENTER = 0.82     # Multiplier at fair=0.50 (18% discount)
 ADAPTIVE_EDGE_FV_BIAS_SLOPE = 0.72      # Additional multiplier per unit distance from 0.50
 
 # Low fair value penalty: cheap contracts (fair < 0.50) need much more edge
-# Multiplier escalates linearly from 1.0 at fair=0.50 to ~4.0 at fair→0
-# Combined with existing FV bias, this makes cheap contracts very hard to trade
-# At fair=0.40 → req ~36%, fair=0.35 → req ~44%, fair=0.30 → req ~53% (clamped 55%)
-# Avg edges run 40-57%, so fair<0.35 is effectively blocked for most assets
+# Multiplier escalates linearly from 1.0 at fair=0.50 to 10.0 at fair→0
+# Creates a steep wall: fair=0.45 needs ~41% edge, fair=0.43 needs ~49%,
+# fair=0.40 hits the 58% ceiling (only 58-60% edge window passes, vs max_edge 60%)
+# Avg edges run 40-57%, so this effectively enforces fair >= ~0.45 for normal trades
+# with a narrow escape hatch at 58-60% edge for truly insane mispricing below that
 LOW_FV_PENALTY_THRESHOLD = 0.50
-LOW_FV_PENALTY_MAX_MULT = 4.0
+LOW_FV_PENALTY_MAX_MULT = 10.0
 
 class CalibrationTracker:
     """
@@ -2529,9 +2530,9 @@ class AdaptiveEdgeManager:
     def _low_fair_value_penalty(model_fair: float) -> float:
         """Cheap contract penalty: escalating edge multiplier when fair < 0.50.
 
-        Returns 1.0 when fair >= 0.50. Scales linearly below:
-          fair=0.45 → 1.30    fair=0.40 → 1.60    fair=0.35 → 1.90
-          fair=0.30 → 2.20    fair=0.20 → 2.80    fair=0.10 → 3.40
+        Returns 1.0 when fair >= 0.50. Scales steeply below:
+          fair=0.48 → 1.36    fair=0.45 → 1.90    fair=0.43 → 2.26
+          fair=0.40 → 2.80    fair=0.35 → 3.70    fair=0.30 → 4.60
         """
         if model_fair >= LOW_FV_PENALTY_THRESHOLD:
             return 1.0
