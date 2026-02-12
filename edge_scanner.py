@@ -125,9 +125,9 @@ KALSHI_MAX_FEE_PER_CONTRACT = 0.02
 KALSHI_MAKER_FEE_RATE = 0.0175
 
 # ── Global risk limits ──────────────────────────────────────────────────────
-MAX_OPEN_POSITIONS_GLOBAL = 6      # Circuit breaker: stop trading above this (tightened for 6 categories)
+MAX_OPEN_POSITIONS_GLOBAL = 9      # Circuit breaker: stop trading above this (9 categories)
 MAX_POSITIONS_PER_MARKET = 1       # Max concurrent positions in a single market
-MAX_TRADES_PER_HOUR = 12           # Rate limit on order placement (tightened: ~2/hr per category)
+MAX_TRADES_PER_HOUR = 18           # Rate limit on order placement (~2/hr per category)
 
 # ── Bankroll management (anti-martingale with trailing stop) ───────────────
 BANKROLL_STOP_LOSS = 20.0             # Base daily stop loss in dollars
@@ -158,6 +158,8 @@ MIN_VOL_ABSOLUTE = {        # Safety-net floor (only for data gaps / warmup)
     "BTC": 0.15,
     "ETH": 0.20,
     "SOL": 0.25,
+    "XRP": 0.25,
+    "DOGE": 0.30,
 }
 VOL_FLOOR_EWMA_MULT = 0.60  # Dynamic floor = 60% of slow EWMA vol
 
@@ -167,7 +169,18 @@ CHAINLINK_SYMBOLS = {
     "BTC": "btc/usd",
     "ETH": "eth/usd",
     "SOL": "sol/usd",
+    "XRP": "xrp/usd",
+    "DOGE": "doge/usd",
 }
+
+# ── Binance REST fallback (for assets not on Polymarket RTDS Chainlink) ────
+# DOGE is not available via Polymarket's Chainlink WebSocket feed.
+# Poll Binance REST API as a fallback price source.
+BINANCE_REST_URL = "https://api.binance.com/api/v3/ticker/price"
+BINANCE_FALLBACK_SYMBOLS = {
+    "DOGE": "DOGEUSDT",
+}
+BINANCE_POLL_INTERVAL = 10  # seconds between REST polls
 
 # ── Rate limiting ───────────────────────────────────────────────────────────
 API_READS_PER_SECOND = 10         # Conservative limit (basic tier allows ~20)
@@ -319,6 +332,65 @@ CATEGORY_CONFIGS = {
         max_seconds_to_expiry=840,
         max_positions_per_category=1,
         max_positions_per_event=1,
+        contracts_per_trade=1,
+        loss_threshold_dollars=-25.0,
+        min_trades_for_breaker=20,
+        min_win_rate=0.30,
+    ),
+    # ── XRP markets ────────────────────────────────────────────────────────
+    "crypto_15min_xrp": CategoryConfig(
+        name="Crypto 15min XRP",
+        enabled=True,
+        series_tickers=["KXXRPMINY"],
+        timeframe="15min",
+        fair_value_model="vol_bs",
+        min_edge_pct=25.0,
+        max_edge_pct=60.0,
+        max_price=0.75,
+        min_price=0.02,
+        min_seconds_to_expiry=90,
+        max_seconds_to_expiry=840,
+        max_positions_per_category=1,
+        max_positions_per_event=1,
+        contracts_per_trade=1,
+        loss_threshold_dollars=-25.0,
+        min_trades_for_breaker=20,
+        min_win_rate=0.30,
+    ),
+    "crypto_daily_xrp": CategoryConfig(
+        name="Crypto Daily XRP",
+        enabled=True,
+        series_tickers=["KXXRPD"],
+        timeframe="daily",
+        fair_value_model="vol_bs",
+        min_edge_pct=25.0,
+        max_edge_pct=60.0,
+        max_price=0.75,
+        min_price=0.02,
+        min_seconds_to_expiry=300,
+        max_seconds_to_expiry=14400,     # Trade within 4 hours of settlement
+        max_positions_per_category=2,
+        max_positions_per_event=2,
+        contracts_per_trade=1,
+        loss_threshold_dollars=-25.0,
+        min_trades_for_breaker=20,
+        min_win_rate=0.30,
+    ),
+    # ── DOGE range markets ─────────────────────────────────────────────────
+    "crypto_range_doge": CategoryConfig(
+        name="Crypto Range DOGE",
+        enabled=True,
+        series_tickers=["KXDOGE"],
+        timeframe="daily",
+        fair_value_model="vol_bs_range",
+        min_edge_pct=25.0,
+        max_edge_pct=60.0,
+        max_price=0.75,
+        min_price=0.02,
+        min_seconds_to_expiry=300,
+        max_seconds_to_expiry=14400,     # Trade within 4 hours of settlement
+        max_positions_per_category=2,
+        max_positions_per_event=2,
         contracts_per_trade=1,
         loss_threshold_dollars=-25.0,
         min_trades_for_breaker=20,
@@ -607,6 +679,18 @@ class BinaryPricer:
                     lo = mid
         return (lo + hi) / 2
 
+    @staticmethod
+    def range_fair_value(
+        S: float, K_floor: float, K_cap: float, seconds_left: float, sigma: float
+    ) -> float:
+        """
+        Price a range binary option: pays $1 if K_floor <= S < K_cap at expiry.
+        Fair value = P(S > K_floor) - P(S > K_cap).
+        """
+        p_above_floor = BinaryPricer.fair_value(S, K_floor, seconds_left, sigma, "up")
+        p_above_cap = BinaryPricer.fair_value(S, K_cap, seconds_left, sigma, "up")
+        return max(0.0, p_above_floor - p_above_cap)
+
 
 # =============================================================================
 # FEE CALCULATOR
@@ -820,6 +904,68 @@ class ChainlinkFeed:
 
     def is_connected(self) -> bool:
         return self._connected
+
+    @property
+    def update_count(self) -> int:
+        return self._update_count
+
+
+class BinanceFallbackFeed:
+    """
+    REST-based price poller for assets not available on Polymarket's Chainlink
+    WebSocket feed (e.g. DOGE). Polls Binance public API every N seconds and
+    feeds prices into the same callback pipeline as ChainlinkFeed.
+    """
+
+    def __init__(self):
+        self._running = False
+        self._callbacks: list = []
+        self._last_prices: dict[str, float] = {}
+        self._update_count = 0
+
+    def on_price(self, callback):
+        self._callbacks.append(callback)
+
+    def start(self):
+        if not BINANCE_FALLBACK_SYMBOLS:
+            return
+        if self._running:
+            return
+        self._running = True
+        t = threading.Thread(target=self._run, daemon=True)
+        t.start()
+
+    def stop(self):
+        self._running = False
+
+    def _run(self):
+        import urllib.request
+        logger.info(
+            f"Binance fallback feed starting for: "
+            f"{', '.join(BINANCE_FALLBACK_SYMBOLS.keys())}"
+        )
+        while self._running:
+            for asset, symbol in BINANCE_FALLBACK_SYMBOLS.items():
+                try:
+                    url = f"{BINANCE_REST_URL}?symbol={symbol}"
+                    req = urllib.request.Request(url, headers={"User-Agent": "edge-scanner/1.0"})
+                    with urllib.request.urlopen(req, timeout=5) as resp:
+                        data = json.loads(resp.read().decode())
+                    price = float(data.get("price", 0))
+                    if price > 0:
+                        self._last_prices[asset] = price
+                        self._update_count += 1
+                        for cb in self._callbacks:
+                            try:
+                                cb(asset, price)
+                            except Exception:
+                                pass
+                except Exception as e:
+                    logger.debug(f"Binance fallback poll error for {asset}: {e}")
+            time.sleep(BINANCE_POLL_INTERVAL)
+
+    def get_price(self, asset: str) -> Optional[float]:
+        return self._last_prices.get(asset.upper())
 
     @property
     def update_count(self) -> int:
@@ -1570,18 +1716,7 @@ class MarketScanner:
         if seconds_left <= 0:
             return self._reject(diag, "expired", ticker)
 
-        # Extract strike and direction from ticker
-        parsed = _extract_strike_from_ticker(ticker)
-        if parsed:
-            strike, direction = parsed
-        else:
-            # Fallback: extract strike from subtitle/metadata (15-min markets)
-            strike = _extract_strike_from_market_data(raw)
-            if not strike:
-                return self._reject(diag, "no_strike", ticker)
-            direction = None  # Signal: both sides should be evaluated
-
-        # Extract asset
+        # Extract asset first (needed for range detection)
         series = raw.get("_series", "")
         asset = _extract_asset_from_series(series)
         if not asset:
@@ -1592,6 +1727,39 @@ class MarketScanner:
                     break
         if not asset:
             return self._reject(diag, "no_asset", ticker)
+
+        # Check for range market (has both floor_strike and cap_strike)
+        floor_strike = raw.get("floor_strike")
+        cap_strike = raw.get("cap_strike")
+        if floor_strike is not None and cap_strike is not None:
+            try:
+                floor_val = float(str(floor_strike).replace(',', '').replace('$', ''))
+                cap_val = float(str(cap_strike).replace(',', '').replace('$', ''))
+                if floor_val > 0 and cap_val > floor_val:
+                    return {
+                        "ticker": ticker,
+                        "event_ticker": raw.get("event_ticker", ""),
+                        "category": raw.get("_category", ""),
+                        "asset": asset,
+                        "direction": "range",
+                        "strike": floor_val,
+                        "cap_strike": cap_val,
+                        "close_time": close_time,
+                        "seconds_left": seconds_left,
+                    }
+            except (ValueError, TypeError):
+                pass
+
+        # Extract strike and direction from ticker
+        parsed = _extract_strike_from_ticker(ticker)
+        if parsed:
+            strike, direction = parsed
+        else:
+            # Fallback: extract strike from subtitle/metadata (15-min markets)
+            strike = _extract_strike_from_market_data(raw)
+            if not strike:
+                return self._reject(diag, "no_strike", ticker)
+            direction = None  # Signal: both sides should be evaluated
 
         return {
             "ticker": ticker,
@@ -2090,6 +2258,7 @@ class EdgeScanner:
         # Components
         self.db = init_db()
         self.chainlink = ChainlinkFeed()
+        self.binance_feed = BinanceFallbackFeed()
         self.vol_tracker = VolTracker()
         self.pricer = BinaryPricer()
         self.scanner = MarketScanner(api)
@@ -2098,8 +2267,9 @@ class EdgeScanner:
         self.bankroll = BankrollManager(self.db)
         self.calibration = CalibrationTracker(self.db)
 
-        # Connect Chainlink price feed to vol tracker
+        # Connect price feeds to vol tracker
         self.chainlink.on_price(self.vol_tracker.feed_price)
+        self.binance_feed.on_price(self.vol_tracker.feed_price)
 
         # Trade counting for hourly rate limit
         self._hourly_trades: deque = deque()
@@ -2145,6 +2315,8 @@ class EdgeScanner:
         """
         spot = self.chainlink.get_price(asset)
         if not spot:
+            spot = self.binance_feed.get_price(asset)
+        if not spot:
             return None
 
         vol = self.vol_tracker.get_adaptive_vol(asset, seconds_left)
@@ -2157,8 +2329,32 @@ class EdgeScanner:
 
         return fair, vol, spot
 
+    def _fair_value_vol_bs_range(
+        self, asset: str, floor_strike: float, cap_strike: float, seconds_left: float
+    ) -> Optional[tuple]:
+        """
+        Black-Scholes vol-based fair value for range binary options.
+        Pays $1 if floor_strike <= S < cap_strike at expiry.
+        Returns (fair_value, vol_used, spot) or None.
+        """
+        spot = self.chainlink.get_price(asset)
+        if not spot:
+            spot = self.binance_feed.get_price(asset)
+        if not spot:
+            return None
+
+        vol = self.vol_tracker.get_adaptive_vol(asset, seconds_left)
+        if not vol:
+            return None
+
+        fair = self.pricer.range_fair_value(spot, floor_strike, cap_strike, seconds_left, vol)
+        fair = max(0.001, min(0.999, fair))
+
+        return fair, vol, spot
+
     def compute_fair_value(
-        self, category: str, asset: str, strike: float, seconds_left: float, direction: str
+        self, category: str, asset: str, strike: float, seconds_left: float,
+        direction: str, cap_strike: float = None
     ) -> Optional[tuple]:
         """
         Compute fair value using the model configured for this category.
@@ -2170,6 +2366,12 @@ class EdgeScanner:
 
         if config.fair_value_model == "vol_bs":
             return self._fair_value_vol_bs(asset, strike, seconds_left, direction)
+
+        if config.fair_value_model == "vol_bs_range":
+            if cap_strike is None:
+                logger.warning(f"Range model requires cap_strike for {category}")
+                return None
+            return self._fair_value_vol_bs_range(asset, strike, cap_strike, seconds_left)
 
         logger.warning(f"Unknown fair value model: {config.fair_value_model}")
         return None
@@ -2211,7 +2413,10 @@ class EdgeScanner:
             return None
 
         # Compute fair value (NO orderbook needed)
-        fv_result = self.compute_fair_value(category, asset, strike, seconds_left, direction)
+        cap_strike = parsed.get("cap_strike")
+        fv_result = self.compute_fair_value(
+            category, asset, strike, seconds_left, direction, cap_strike=cap_strike
+        )
         if not fv_result:
             return None
         fair, vol, spot = fv_result
@@ -2255,8 +2460,8 @@ class EdgeScanner:
 
         # Get orderbook
         ob = await self.api.get_orderbook(ticker)
-        # For "up" direction, we buy YES side. For "down", we buy NO side.
-        side = "yes" if direction == "up" else "no"
+        # For "up"/"range" direction, we buy YES side. For "down", we buy NO side.
+        side = "yes" if direction in ("up", "range") else "no"
         ask_price = ob.get(f"{side}_ask")
         ask_size = ob.get(f"{side}_ask_size", 0)
 
@@ -2346,7 +2551,7 @@ class EdgeScanner:
         if contracts <= 0:
             logger.warning(f"Bankroll: insufficient balance for {opp.ticker}")
             return None
-        side = "yes" if opp.direction == "up" else "no"
+        side = "yes" if opp.direction in ("up", "range") else "no"
         trade_id = f"ES-{int(time.time())}-{uuid.uuid4().hex[:6]}"
 
         # Pre-execution logging
@@ -2640,7 +2845,7 @@ class EdgeScanner:
                     continue
 
                 result = settlement.get("result", "")
-                side = "yes" if direction == "up" else "no"
+                side = "yes" if direction in ("up", "range") else "no"
                 won = (side == "yes" and result == "yes") or (side == "no" and result == "no")
 
                 payout = contracts * 1.0 if won else 0.0
@@ -2754,7 +2959,7 @@ class EdgeScanner:
                 result = market_data.get("result", "")
 
                 if status == "settled" or result in ("yes", "no"):
-                    side = "yes" if direction == "up" else "no"
+                    side = "yes" if direction in ("up", "range") else "no"
                     won = (side == "yes" and result == "yes") or (side == "no" and result == "no")
 
                     payout = (contracts or 0) * 1.0 if won else 0.0
@@ -2834,7 +3039,7 @@ class EdgeScanner:
             result = settlement.get("result", "")
 
             # Determine if hypothetical trade would have won
-            side = "yes" if direction == "up" else "no"
+            side = "yes" if direction in ("up", "range") else "no"
             won = (side == "yes" and result == "yes") or (side == "no" and result == "no")
 
             # Hypothetical P&L: buy 1 contract at ask_price
@@ -3250,19 +3455,21 @@ class EdgeScanner:
         # Backfill unsettled trades from previous sessions
         await self.backfill_unsettled_trades()
 
-        # Start Chainlink feed
+        # Start price feeds
         self.chainlink.start()
-        logger.info("Chainlink price feed starting...")
+        self.binance_feed.start()
+        logger.info("Price feeds starting (Chainlink + Binance fallback)...")
 
-        # Wait for initial vol warmup
-        logger.info(f"Waiting {VOL_WARMUP_SECONDS}s for vol warmup...")
+        # Wait for initial vol warmup (only require core assets, not fallback ones)
+        core_assets = set(CHAINLINK_SYMBOLS.keys()) - set(BINANCE_FALLBACK_SYMBOLS.keys())
+        logger.info(f"Waiting {VOL_WARMUP_SECONDS}s for vol warmup (core: {', '.join(sorted(core_assets))})...")
         warmup_start = time.time()
         while self._running:
             all_warmed = all(
-                self.vol_tracker.is_warmed_up(a) for a in CHAINLINK_SYMBOLS
+                self.vol_tracker.is_warmed_up(a) for a in core_assets
             )
             if all_warmed:
-                logger.info("Vol warmup complete for all assets")
+                logger.info("Vol warmup complete for core assets")
                 break
             elapsed = time.time() - warmup_start
             if elapsed > VOL_WARMUP_SECONDS * 3:  # 3x timeout
@@ -3270,9 +3477,11 @@ class EdgeScanner:
                 break
             # Print progress
             warmed = sum(1 for a in CHAINLINK_SYMBOLS if self.vol_tracker.is_warmed_up(a))
+            core_ready = sum(1 for a in core_assets if self.vol_tracker.is_warmed_up(a))
             if int(elapsed) % 15 == 0:
                 logger.info(
-                    f"Warmup: {warmed}/{len(CHAINLINK_SYMBOLS)} assets ready | "
+                    f"Warmup: {warmed}/{len(CHAINLINK_SYMBOLS)} total, "
+                    f"{core_ready}/{len(core_assets)} core ready | "
                     f"{self.vol_tracker.status_str()}"
                 )
             await asyncio.sleep(3)
