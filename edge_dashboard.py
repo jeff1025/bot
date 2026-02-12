@@ -137,6 +137,16 @@ def get_dashboard_data() -> dict:
             except (json.JSONDecodeError, IOError):
                 pass
 
+        # Load calibration state from JSON (written by edge_scanner)
+        calibration = {}
+        calibration_path = DATA_DIR / "calibration_state.json"
+        if calibration_path.exists():
+            try:
+                with open(calibration_path, "r") as f:
+                    calibration = json.load(f)
+            except (json.JSONDecodeError, IOError):
+                pass
+
         # Shadow trades — settled ones for calibration analysis
         shadow_settled = []
         shadow_pending = 0
@@ -169,6 +179,7 @@ def get_dashboard_data() -> dict:
             "total_pnl": round(total_pnl, 2),
             "overrides": overrides,
             "bankroll": bankroll,
+            "calibration": calibration,
             "shadow_settled": shadow_settled,
             "shadow_pending": shadow_pending,
         }
@@ -329,6 +340,12 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <div class="bankroll-section" id="bankroll-section">
   <h3>Bankroll Management</h3>
   <div class="bankroll-row" id="bankroll-panel"></div>
+</div>
+
+<!-- Model Calibration -->
+<div class="bankroll-section" id="calibration-section">
+  <h3>Model Calibration</h3>
+  <div class="bankroll-row" id="calibration-panel"></div>
 </div>
 
 <!-- Category Controls -->
@@ -497,6 +514,43 @@ function renderBankroll(data) {
     <div class="card${stoppedCard}"><div class="label">Tier</div><div class="value neutral">${tierLabel} (${contracts}x)</div></div>
     <div class="card${stoppedCard}"><div class="label">Balance</div><div class="value ${balance < 5 ? 'yellow' : 'neutral'}">$${balance.toFixed(2)}</div></div>
     <div class="card${stoppedCard}"><div class="label">Status</div><div class="value ${statusCls}">${statusText}</div></div>
+  `;
+}
+
+function renderCalibration(data) {
+  const cal = data.calibration || {};
+  const el = document.getElementById('calibration-panel');
+  const section = document.getElementById('calibration-section');
+  if (!el) return;
+  if (!cal.n) { section.style.display = 'none'; return; }
+  section.style.display = '';
+
+  if (!cal.sufficient) {
+    el.innerHTML = `
+      <div class="card"><div class="label">Status</div><div class="value neutral">Awaiting Data</div></div>
+      <div class="card"><div class="label">Shadow Trades</div><div class="value neutral">${cal.n} / 20</div></div>
+    `;
+    return;
+  }
+
+  const brierCls = cal.brier < 0.20 ? 'green' : cal.brier < 0.30 ? 'yellow' : 'red';
+  const ocCls = cal.overconfidence < 1.1 ? 'green' : cal.overconfidence < 1.3 ? 'yellow' : 'red';
+
+  // Per-asset bias cards
+  const bias = cal.asset_bias || {};
+  let biasHtml = '';
+  for (const [asset, pct] of Object.entries(bias)) {
+    const bCls = Math.abs(pct) < 5 ? 'green' : Math.abs(pct) < 15 ? 'yellow' : 'red';
+    biasHtml += `<div class="card"><div class="label">${asset} Bias</div><div class="value ${bCls}">${pct > 0 ? '+' : ''}${pct}%</div></div>`;
+  }
+
+  el.innerHTML = `
+    <div class="card"><div class="label">Brier Score</div><div class="value ${brierCls}">${cal.brier.toFixed(3)}</div></div>
+    <div class="card"><div class="label">Overconfidence</div><div class="value ${ocCls}">${cal.overconfidence.toFixed(2)}x</div></div>
+    <div class="card"><div class="label">Predicted WR</div><div class="value neutral">${cal.predicted_wr.toFixed(1)}%</div></div>
+    <div class="card"><div class="label">Actual WR</div><div class="value ${cal.actual_wr >= cal.predicted_wr ? 'green' : 'red'}">${cal.actual_wr.toFixed(1)}%</div></div>
+    ${biasHtml}
+    <div class="card"><div class="label">Shadow Trades</div><div class="value neutral">${cal.n}</div></div>
   `;
 }
 
@@ -921,6 +975,7 @@ async function refresh() {
     lastData = data;
     renderSummary(data);
     renderBankroll(data);
+    renderCalibration(data);
     renderCatTable(data);
     renderTradesTable(data);
     updateCharts(data);

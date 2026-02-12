@@ -152,13 +152,14 @@ MINUTES_PER_YEAR = 525_960
 SECONDS_PER_YEAR = MINUTES_PER_YEAR * 60
 EWMA_LAMBDA_FAST = 0.90    # Half-life ~7 observations
 EWMA_LAMBDA_SLOW = 0.97    # Half-life ~23 observations
-VOL_DAMPENER = 1.0          # Scale factor on raw vol (1.0 = no dampening)
+VOL_DAMPENER = 0.90         # Conservative 10% haircut on vol (fewer but higher-quality trades)
 
-MIN_VOL_FLOOR = {
-    "BTC": 0.30,
-    "ETH": 0.40,
-    "SOL": 0.50,
+MIN_VOL_ABSOLUTE = {        # Safety-net floor (only for data gaps / warmup)
+    "BTC": 0.15,
+    "ETH": 0.20,
+    "SOL": 0.25,
 }
+VOL_FLOOR_EWMA_MULT = 0.60  # Dynamic floor = 60% of slow EWMA vol
 
 # ── Chainlink price feed ────────────────────────────────────────────────────
 CHAINLINK_WS_URL = "wss://ws-live-data.polymarket.com"
@@ -998,9 +999,14 @@ class VolTracker:
         if raw_vol is None:
             return None
 
-        # Apply floor
-        floor = MIN_VOL_FLOOR.get(asset, 0.30)
-        raw_vol = max(raw_vol, floor)
+        # Dynamic floor: adapts to current vol regime instead of fixed minimums
+        abs_floor = MIN_VOL_ABSOLUTE.get(asset, 0.15)
+        slow_vol = self.get_ewma_vol(asset, "slow")
+        if slow_vol and slow_vol > 0:
+            dynamic_floor = max(abs_floor, slow_vol * VOL_FLOOR_EWMA_MULT)
+        else:
+            dynamic_floor = abs_floor
+        raw_vol = max(raw_vol, dynamic_floor)
 
         return raw_vol * VOL_DAMPENER
 
@@ -1949,6 +1955,117 @@ class BankrollManager:
 
 
 # =============================================================================
+# CALIBRATION TRACKER — Measures model accuracy from shadow trades
+# =============================================================================
+
+CALIBRATION_MIN_SAMPLES = 20  # Don't report metrics until this many shadow settlements
+
+class CalibrationTracker:
+    """
+    Measures how well the model's fair values predict actual outcomes.
+    Uses settled shadow trades (which log model_fair + settlement_result
+    for every priced market, not just ones we trade).
+
+    Key metrics:
+        Brier Score: mean((predicted - outcome)²). Perfect=0, coin flip=0.25.
+        Overconfidence: mean(predicted) / actual_win_rate. >1 = model overconfident.
+        Per-asset bias: predicted vs actual win rate per asset.
+    """
+
+    def __init__(self, db: sqlite3.Connection):
+        self.db = db
+        self._state: dict = {}
+
+    def compute(self, lookback_days: int = 7) -> dict:
+        """Compute calibration metrics from recent shadow trades."""
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=lookback_days)).isoformat()
+
+        rows = self.db.execute(
+            """
+            SELECT model_fair, direction, settlement_result, won, asset
+            FROM shadow_trades
+            WHERE settled=1 AND settlement_result IN ('yes', 'no')
+            AND settled_at > ?
+            """,
+            (cutoff,),
+        ).fetchall()
+
+        n = len(rows)
+        if n < CALIBRATION_MIN_SAMPLES:
+            self._state = {"n": n, "sufficient": False}
+            return self._state
+
+        # For each shadow trade, model_fair is the probability the contract pays out
+        # in the direction we would buy. won=1 means it did pay out.
+        brier_sum = 0.0
+        pred_sum = 0.0
+        wins = 0
+        asset_data: dict = {}
+
+        for model_fair, direction, settlement_result, won, asset in rows:
+            outcome = 1.0 if won else 0.0
+            brier_sum += (model_fair - outcome) ** 2
+            pred_sum += model_fair
+            wins += won or 0
+
+            if asset not in asset_data:
+                asset_data[asset] = {"pred_sum": 0.0, "wins": 0, "n": 0}
+            asset_data[asset]["pred_sum"] += model_fair
+            asset_data[asset]["wins"] += won or 0
+            asset_data[asset]["n"] += 1
+
+        brier = brier_sum / n
+        actual_wr = wins / n if n > 0 else 0
+        predicted_wr = pred_sum / n if n > 0 else 0
+        overconfidence = predicted_wr / actual_wr if actual_wr > 0 else 0.0
+
+        # Per-asset bias: (predicted_wr - actual_wr) as percentage points
+        asset_bias = {}
+        for asset, d in asset_data.items():
+            a_n = d["n"]
+            if a_n >= 5:
+                a_pred = d["pred_sum"] / a_n
+                a_actual = d["wins"] / a_n
+                asset_bias[asset] = round((a_pred - a_actual) * 100, 1)
+
+        self._state = {
+            "n": n,
+            "sufficient": True,
+            "brier": round(brier, 4),
+            "predicted_wr": round(predicted_wr * 100, 1),
+            "actual_wr": round(actual_wr * 100, 1),
+            "overconfidence": round(overconfidence, 3),
+            "asset_bias": asset_bias,
+            "lookback_days": lookback_days,
+        }
+        return self._state
+
+    def should_warn(self) -> Optional[str]:
+        """Return warning string if calibration is badly off."""
+        if not self._state.get("sufficient"):
+            return None
+        brier = self._state.get("brier", 0)
+        oc = self._state.get("overconfidence", 1.0)
+        if brier > 0.30:
+            return f"Brier score {brier:.3f} is high (>0.30) — model poorly calibrated"
+        if oc > 1.3:
+            return f"Overconfidence {oc:.2f}x — model predicting {self._state['predicted_wr']:.0f}% but actual {self._state['actual_wr']:.0f}%"
+        return None
+
+    def get_state(self) -> dict:
+        return dict(self._state)
+
+    def write_state_file(self):
+        """Write calibration state to JSON for the web dashboard."""
+        try:
+            state_path = os.path.join(LOG_DIR, "calibration_state.json")
+            with open(state_path, "w") as f:
+                json.dump(self._state, f, indent=2)
+        except Exception:
+            pass
+
+
+# =============================================================================
 # EDGE SCANNER ENGINE — The core scanning + execution loop
 # =============================================================================
 
@@ -1979,6 +2096,7 @@ class EdgeScanner:
         self.positions = PositionTracker()
         self.cat_stats = CategoryStatsTracker(self.db)
         self.bankroll = BankrollManager(self.db)
+        self.calibration = CalibrationTracker(self.db)
 
         # Connect Chainlink price feed to vol tracker
         self.chainlink.on_price(self.vol_tracker.feed_price)
@@ -2737,6 +2855,12 @@ class EdgeScanner:
         settled_count = sum(1 for t in ticker_results.values() if t.get("settled"))
         if settled_count > 0:
             logger.info(f"SHADOW: Settled {settled_count} shadow trades")
+            # Update calibration metrics after new settlements
+            self.calibration.compute()
+            self.calibration.write_state_file()
+            warn = self.calibration.should_warn()
+            if warn:
+                logger.warning(f"CALIBRATION: {warn}")
 
     # ── Reconciliation ──────────────────────────────────────────────────────
 
@@ -3077,6 +3201,19 @@ class EdgeScanner:
                 f"Bal=${bk['balance']:.2f}"
             )
         lines.append(f"  Trades/hr: {hourly_count}/{MAX_TRADES_PER_HOUR}")
+
+        # Calibration
+        cal = self.calibration.get_state()
+        if cal.get("sufficient"):
+            bias_parts = [f"{a}={b:+.0f}%" for a, b in cal.get("asset_bias", {}).items()]
+            bias_str = " ".join(bias_parts) if bias_parts else "—"
+            lines.append(
+                f"  Calibration: Brier={cal['brier']:.3f} | "
+                f"Bias={cal['overconfidence']:.2f}x | "
+                f"{cal['n']} shadow | {bias_str}"
+            )
+        elif cal.get("n", 0) > 0:
+            lines.append(f"  Calibration: awaiting data ({cal['n']}/{CALIBRATION_MIN_SAMPLES} shadow settlements)")
 
         # Disabled categories
         if self._disabled_categories:
