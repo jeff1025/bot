@@ -111,7 +111,7 @@ KALSHI_DEMO_API_BASE = "https://demo-api.kalshi.co/trade-api/v2"
 KALSHI_DEMO_WS_URL = "wss://demo-api.kalshi.co/trade-api/ws/v2"
 
 # ── Scan timing ─────────────────────────────────────────────────────────────
-SCAN_INTERVAL_SECONDS = 5       # Seconds between full market scans (must be < window width)
+SCAN_INTERVAL_SECONDS = 3       # Seconds between full market scans (must be < window width)
 RECONCILE_INTERVAL_SECONDS = 120  # Seconds between position reconciliation checks
 SETTLEMENT_CHECK_INTERVAL = 30  # Seconds between settlement checks
 STATS_PRINT_INTERVAL = 60       # Seconds between dashboard prints
@@ -185,7 +185,7 @@ BINANCE_FALLBACK_SYMBOLS = {
 BINANCE_POLL_INTERVAL = 10  # seconds between REST polls
 
 # ── Rate limiting ───────────────────────────────────────────────────────────
-API_READS_PER_SECOND = 10         # Conservative limit (basic tier allows ~20)
+API_READS_PER_SECOND = 15         # Below ~20 tier limit; headroom for orderbook bursts
 API_WRITES_PER_SECOND = 5         # Conservative limit (basic tier allows ~10)
 MIN_ORDER_INTERVAL_SECONDS = 1.0  # Minimum time between order submissions
 
@@ -3679,7 +3679,7 @@ class EdgeScanner:
                 parsed_markets.append(parsed)
 
         # Log parse diagnostics
-        logger.info(
+        logger.debug(
             f"PARSE: {pd['total']} raw -> {pd['passed']} parsed | "
             f"status={pd['status_filtered']} expired={pd['expired']} "
             f"no_strike={pd['no_strike']} no_asset={pd['no_asset']} "
@@ -3714,10 +3714,22 @@ class EdgeScanner:
         self._last_scan_diag["pre_screened"] = len(candidates)
         self._last_scan_diag["orderbook_fetched"] = len(top_candidates)
 
-        logger.info(
+        logger.debug(
             f"BATCH: {len(parsed_markets)} parsed -> {len(candidates)} pre-screened -> "
             f"top {len(top_candidates)} for orderbook"
         )
+
+        # Log compact diagnostics ONLY when near a close window
+        d = self._last_scan_diag
+        tf = d["time_filtered"]
+        fvx = d["fv_extreme_filtered"]
+        if len(candidates) > 0 or (tf < len(parsed_markets) and len(parsed_markets) > 0):
+            logger.info(
+                f"WINDOW: {len(parsed_markets)} markets | "
+                f"{len(candidates)} in-window | "
+                f"time_out={tf} fv_extreme={fvx} | "
+                f"top {len(top_candidates)} for orderbook"
+            )
 
         # 5. Fetch orderbook ONLY for top candidates
         opportunities = []
@@ -3790,14 +3802,17 @@ class EdgeScanner:
         except Exception:
             pass
 
-        if opportunities or self.verbose:
-            logger.info(
-                f"SCAN: {len(parsed_markets)} markets | "
-                f"{len(opportunities)} opportunities | "
-                f"{trades_executed} trades | "
-                f"best edge={best_edge:.1f}% | "
-                f"{scan_duration_ms:.0f}ms"
-            )
+        scan_msg = (
+            f"SCAN: {len(parsed_markets)} markets | "
+            f"{len(opportunities)} opportunities | "
+            f"{trades_executed} trades | "
+            f"best edge={best_edge:.1f}% | "
+            f"{scan_duration_ms:.0f}ms"
+        )
+        if opportunities:
+            logger.info(scan_msg)
+        else:
+            logger.debug(scan_msg)
 
         return {
             "markets_scanned": len(parsed_markets),
