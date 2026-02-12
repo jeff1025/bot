@@ -2128,6 +2128,14 @@ class BankrollManager:
 
 CALIBRATION_MIN_SAMPLES = 20  # Don't report metrics until this many shadow settlements
 
+# ── Adaptive edge thresholds (dynamic per-price-level edge requirements) ──
+ADAPTIVE_EDGE_HALF_LIFE_HOURS = 48.0    # Recency decay: trades from 48h ago get 50% weight
+ADAPTIVE_EDGE_PRICE_BANDWIDTH = 0.03    # Gaussian kernel bandwidth in dollars ($0.03)
+ADAPTIVE_EDGE_MIN_WEIGHT = 3.0          # Minimum effective sample weight to produce adjustment
+ADAPTIVE_EDGE_FLOOR_PCT = 15.0          # Hard floor: never require less edge than this
+ADAPTIVE_EDGE_CEILING_PCT = 45.0        # Hard ceiling: never require more edge than this
+ADAPTIVE_EDGE_MIN_SAMPLES = 30          # Don't activate until this many settled shadow trades
+
 class CalibrationTracker:
     """
     Measures how well the model's fair values predict actual outcomes.
@@ -2234,6 +2242,180 @@ class CalibrationTracker:
 
 
 # =============================================================================
+# ADAPTIVE EDGE MANAGER — Per-price-level dynamic edge thresholds
+# =============================================================================
+
+class AdaptiveEdgeManager:
+    """
+    Computes per-price-level required edge thresholds using kernel-weighted
+    shadow trade outcomes.
+
+    Uses Gaussian kernels in both time (recency) and price space so that:
+      - Each penny ($0.01) gets its own threshold (smooth interpolation)
+      - Recent trades matter more than old ones (exponential decay)
+      - Sparse price points borrow strength from neighbors
+
+    The adjustment is a calibration ratio:
+      ratio = predicted_wr / actual_wr  at that price level
+    Applied as: adjusted_edge = base_min_edge * ratio
+      - ratio > 1  → model overconfident at this price → require MORE edge
+      - ratio < 1  → model underconfident → require LESS edge (within bounds)
+    """
+
+    def __init__(self, db: sqlite3.Connection):
+        self.db = db
+        self._cache: dict = {}       # (asset, price_cents) -> calibration_ratio
+        self._active: bool = False
+        self._last_refresh: float = 0
+        self._stats: dict = {}
+
+    def refresh(self):
+        """Recompute the adaptive edge surface from shadow trade history."""
+        rows = self.db.execute(
+            """
+            SELECT asset, ask_price, model_fair, won, settled_at
+            FROM shadow_trades
+            WHERE settled=1 AND settlement_result IN ('yes', 'no')
+            """
+        ).fetchall()
+
+        n = len(rows)
+        if n < ADAPTIVE_EDGE_MIN_SAMPLES:
+            self._active = False
+            self._stats = {"n": n, "active": False}
+            return
+
+        now = datetime.now(timezone.utc)
+        ln2 = math.log(2)
+
+        # Parse rows and compute recency weights
+        trades = []
+        for asset, ask_price, model_fair, won, settled_at in rows:
+            try:
+                settled_dt = datetime.fromisoformat(settled_at)
+                if settled_dt.tzinfo is None:
+                    settled_dt = settled_dt.replace(tzinfo=timezone.utc)
+                age_hours = max(0.0, (now - settled_dt).total_seconds() / 3600)
+            except Exception:
+                age_hours = 168.0  # Fallback to 1 week
+            recency_w = math.exp(-age_hours / ADAPTIVE_EDGE_HALF_LIFE_HOURS * ln2)
+            trades.append((asset, ask_price, model_fair, won or 0, recency_w))
+
+        # Group by asset
+        assets: dict = {}
+        for asset, price, fair, won, rw in trades:
+            if asset not in assets:
+                assets[asset] = []
+            assets[asset].append((price, fair, won, rw))
+
+        bw_sq_2 = 2.0 * ADAPTIVE_EDGE_PRICE_BANDWIDTH ** 2
+        new_cache: dict = {}
+        adjustments_log: dict = {}  # asset -> list of (price, ratio) for stats
+
+        for asset, asset_trades in assets.items():
+            adjustments_log[asset] = []
+
+            # Evaluate at each penny from $0.02 to $0.75
+            for price_cents in range(2, 76):
+                target_price = price_cents / 100.0
+
+                weighted_wins = 0.0
+                weighted_total = 0.0
+                weighted_pred_sum = 0.0
+
+                for price, fair, won, rw in asset_trades:
+                    price_diff = price - target_price
+                    price_w = math.exp(-(price_diff ** 2) / bw_sq_2)
+                    combined_w = rw * price_w
+
+                    weighted_wins += won * combined_w
+                    weighted_total += combined_w
+                    weighted_pred_sum += fair * combined_w
+
+                if weighted_total < ADAPTIVE_EDGE_MIN_WEIGHT:
+                    continue  # Not enough data at this price point
+
+                actual_wr = weighted_wins / weighted_total
+                predicted_wr = weighted_pred_sum / weighted_total
+
+                # Calibration ratio
+                if actual_wr > 0.05:
+                    ratio = predicted_wr / actual_wr
+                elif actual_wr > 0.01:
+                    # Very low actual WR — cap ratio to avoid extreme values
+                    ratio = min(2.0, predicted_wr / actual_wr)
+                else:
+                    # Near-zero wins: model badly overconfident at this price
+                    ratio = 2.0
+
+                # Clamp ratio to prevent runaway feedback
+                ratio = max(0.6, min(2.0, ratio))
+                new_cache[(asset, price_cents)] = ratio
+                adjustments_log[asset].append((price_cents, ratio))
+
+        self._cache = new_cache
+        self._active = True
+        self._last_refresh = time.time()
+
+        # Build summary stats for dashboard/logging
+        asset_summaries = {}
+        for asset, adjustments in adjustments_log.items():
+            if not adjustments:
+                continue
+            ratios = [r for _, r in adjustments]
+            asset_summaries[asset] = {
+                "price_points": len(adjustments),
+                "avg_ratio": round(sum(ratios) / len(ratios), 3),
+                "min_ratio": round(min(ratios), 3),
+                "max_ratio": round(max(ratios), 3),
+            }
+        self._stats = {
+            "n": n,
+            "active": True,
+            "assets": asset_summaries,
+            "total_price_points": len(new_cache),
+        }
+
+    def get_required_edge(self, asset: str, ask_price: float, base_min_edge: float) -> float:
+        """
+        Get the dynamically adjusted edge threshold for a specific asset and price.
+
+        Returns adjusted min_edge_pct, clamped to [FLOOR, CEILING].
+        Falls back to base_min_edge when adaptive data is insufficient.
+        """
+        if not self._active:
+            return base_min_edge
+
+        price_cents = round(ask_price * 100)
+        ratio = self._cache.get((asset, price_cents))
+        if ratio is None:
+            return base_min_edge
+
+        adjusted = base_min_edge * ratio
+        return max(ADAPTIVE_EDGE_FLOOR_PCT, min(ADAPTIVE_EDGE_CEILING_PCT, adjusted))
+
+    def get_state(self) -> dict:
+        return dict(self._stats)
+
+    def write_state_file(self):
+        """Write adaptive edge state to JSON for the web dashboard."""
+        try:
+            state_path = os.path.join(LOG_DIR, "adaptive_edge_state.json")
+            # Include sample of actual thresholds for inspection
+            sample_thresholds = {}
+            for (asset, pc), ratio in sorted(self._cache.items()):
+                if asset not in sample_thresholds:
+                    sample_thresholds[asset] = {}
+                sample_thresholds[asset][f"${pc/100:.2f}"] = round(ratio, 3)
+
+            state = {**self._stats, "thresholds": sample_thresholds}
+            with open(state_path, "w") as f:
+                json.dump(state, f, indent=2)
+        except Exception:
+            pass
+
+
+# =============================================================================
 # EDGE SCANNER ENGINE — The core scanning + execution loop
 # =============================================================================
 
@@ -2266,6 +2448,7 @@ class EdgeScanner:
         self.cat_stats = CategoryStatsTracker(self.db)
         self.bankroll = BankrollManager(self.db)
         self.calibration = CalibrationTracker(self.db)
+        self.adaptive_edge = AdaptiveEdgeManager(self.db)
 
         # Connect price feeds to vol tracker
         self.chainlink.on_price(self.vol_tracker.feed_price)
@@ -2499,8 +2682,11 @@ class EdgeScanner:
                 fee=fee, implied_vol=None,
             )
 
-        # Edge filters
-        if gross_edge_pct < config.min_edge_pct:
+        # Edge filters — use adaptive threshold when available
+        required_edge = self.adaptive_edge.get_required_edge(
+            asset, ask_price, config.min_edge_pct
+        )
+        if gross_edge_pct < required_edge:
             if gross_edge_pct > 0:
                 diag["near_misses"] += 1
             else:
@@ -2555,12 +2741,17 @@ class EdgeScanner:
         trade_id = f"ES-{int(time.time())}-{uuid.uuid4().hex[:6]}"
 
         # Pre-execution logging
+        config = CATEGORY_CONFIGS.get(opp.category)
+        req_edge = self.adaptive_edge.get_required_edge(
+            opp.asset, opp.ask_price, config.min_edge_pct if config else 25.0
+        )
         logger.info(
             f"{'[PAPER] ' if self.paper_mode else ''}"
             f"TRADE {opp.asset} {opp.direction.upper()} | "
             f"{opp.ticker} | strike=${opp.strike:,.0f} | "
             f"fair={opp.model_fair:.3f} ask={opp.ask_price:.3f} | "
-            f"edge={opp.gross_edge_pct:.1f}% (net={opp.net_edge_pct:.1f}%) | "
+            f"edge={opp.gross_edge_pct:.1f}% (net={opp.net_edge_pct:.1f}%) "
+            f"req={req_edge:.1f}% | "
             f"vol={opp.model_vol*100:.1f}% | {opp.seconds_left:.0f}s left"
         )
 
@@ -3066,6 +3257,15 @@ class EdgeScanner:
             warn = self.calibration.should_warn()
             if warn:
                 logger.warning(f"CALIBRATION: {warn}")
+            # Update adaptive edge thresholds from new settlement data
+            self.adaptive_edge.refresh()
+            self.adaptive_edge.write_state_file()
+            ae_state = self.adaptive_edge.get_state()
+            if ae_state.get("active"):
+                logger.info(
+                    f"ADAPTIVE EDGE: active | {ae_state['n']} shadow trades | "
+                    f"{ae_state['total_price_points']} price points"
+                )
 
     # ── Reconciliation ──────────────────────────────────────────────────────
 
@@ -3420,6 +3620,23 @@ class EdgeScanner:
         elif cal.get("n", 0) > 0:
             lines.append(f"  Calibration: awaiting data ({cal['n']}/{CALIBRATION_MIN_SAMPLES} shadow settlements)")
 
+        # Adaptive edge
+        ae = self.adaptive_edge.get_state()
+        if ae.get("active"):
+            ae_parts = []
+            for asset, info in ae.get("assets", {}).items():
+                avg = info.get("avg_ratio", 1.0)
+                # Show as effective edge: base 25% * ratio
+                eff = 25.0 * avg
+                ae_parts.append(f"{asset}={eff:.0f}%avg")
+            ae_str = " ".join(ae_parts) if ae_parts else "—"
+            lines.append(
+                f"  Adaptive Edge: ON | {ae['n']} trades | "
+                f"{ae['total_price_points']} price pts | {ae_str}"
+            )
+        elif ae.get("n", 0) > 0:
+            lines.append(f"  Adaptive Edge: awaiting data ({ae['n']}/{ADAPTIVE_EDGE_MIN_SAMPLES} settled shadows)")
+
         # Disabled categories
         if self._disabled_categories:
             lines.append(f"\n  DISABLED: {', '.join(self._disabled_categories)}")
@@ -3454,6 +3671,18 @@ class EdgeScanner:
 
         # Backfill unsettled trades from previous sessions
         await self.backfill_unsettled_trades()
+
+        # Initialize adaptive edge from existing shadow trade history
+        self.adaptive_edge.refresh()
+        self.adaptive_edge.write_state_file()
+        ae = self.adaptive_edge.get_state()
+        if ae.get("active"):
+            logger.info(
+                f"Adaptive edge initialized: {ae['n']} shadow trades, "
+                f"{ae['total_price_points']} price points"
+            )
+        else:
+            logger.info(f"Adaptive edge: awaiting data ({ae.get('n', 0)}/{ADAPTIVE_EDGE_MIN_SAMPLES} settled shadows)")
 
         # Start price feeds
         self.chainlink.start()
