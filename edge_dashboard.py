@@ -520,6 +520,29 @@ const CATS = [
 let charts = {};
 let lastData = null;
 
+// ── UTC → EST/EDT conversion ─────────────────────────────────────────────────
+function utcToEst(isoStr) {
+  if (!isoStr) return '';
+  try {
+    const d = new Date(isoStr.endsWith('Z') || isoStr.includes('+') ? isoStr : isoStr + 'Z');
+    return d.toLocaleString('en-US', {timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false}).replace(',', '');
+  } catch { return isoStr.replace('T', ' ').slice(0, 19); }
+}
+function utcToEstShort(isoStr) {
+  if (!isoStr) return '';
+  try {
+    const d = new Date(isoStr.endsWith('Z') || isoStr.includes('+') ? isoStr : isoStr + 'Z');
+    return d.toLocaleString('en-US', {timeZone: 'America/New_York', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false}).replace(',', '');
+  } catch { return isoStr.slice(5, 16).replace('T', ' '); }
+}
+function utcHourToEstHour(isoStr) {
+  if (!isoStr) return NaN;
+  try {
+    const d = new Date(isoStr.endsWith('Z') || isoStr.includes('+') ? isoStr : isoStr + 'Z');
+    return parseInt(d.toLocaleString('en-US', {timeZone: 'America/New_York', hour: '2-digit', hour12: false}));
+  } catch { return parseInt(isoStr.slice(11, 13)); }
+}
+
 // ── Edge slider logic ────────────────────────────────────────────────────────
 
 function onEdgeChange(catKey, val) {
@@ -780,7 +803,7 @@ function renderTradesTable(data) {
       !isSettled ? '<span class="badge open">OPEN</span>' :
       (won ? '<span class="badge win">WIN</span>' : '<span class="badge loss">LOSS</span>');
     const paperBadge = t.paper_trade ? '<span class="badge paper">PAPER</span>' : '';
-    const ts = (t.timestamp || '').replace('T', ' ').slice(0, 19);
+    const ts = utcToEst(t.timestamp);
     const cat = CATS.find(c => c.key === t.category);
     const catLabel = cat ? cat.label : t.category;
     const catColor = cat ? cat.color : '#64748b';
@@ -954,7 +977,7 @@ function updateCharts(data) {
     // Total cumulative
     let cumPnl = 0;
     const totalLine = settled.map(t => { cumPnl += t.pnl; return cumPnl; });
-    const labels = settled.map(t => (t.settled_at || '').slice(5, 16).replace('T', ' '));
+    const labels = settled.map(t => utcToEstShort(t.settled_at));
 
     // Per-category cumulative
     const catCums = {};
@@ -1021,10 +1044,10 @@ function updateCharts(data) {
   // 5. P&L by hour of day
   const hourPnl = new Array(24).fill(0);
   for (const t of settled) {
-    const h = parseInt((t.settled_at || '').slice(11, 13));
+    const h = utcHourToEstHour(t.settled_at);
     if (!isNaN(h)) hourPnl[h] += t.pnl;
   }
-  charts.hour.data.labels = Array.from({length:24}, (_,i) => `${String(i).padStart(2,'0')}:00`);
+  charts.hour.data.labels = Array.from({length:24}, (_,i) => `${String(i).padStart(2,'0')}:00 ET`);
   charts.hour.data.datasets = [{
     data: hourPnl.map(v => +v.toFixed(2)),
     backgroundColor: hourPnl.map(v => v >= 0 ? '#22c55e' : '#ef4444'),
@@ -1137,7 +1160,7 @@ function renderShadowAnalysis(data) {
   // 3. Cumulative shadow P&L over time (total + by threshold level)
   if (shadow.length > 0) {
     const sorted = [...shadow].sort((a, b) => (a.settled_at || '').localeCompare(b.settled_at || ''));
-    const labels = sorted.map(t => (t.settled_at || '').slice(5, 16).replace('T', ' '));
+    const labels = sorted.map(t => utcToEstShort(t.settled_at));
 
     const thresholds = [
       {min: 0, label: 'All > 0%', color: '#94a3b8'},
@@ -1175,7 +1198,7 @@ function renderCalHistory(data) {
   if (wrap) wrap.style.display = history.length < 1 ? 'none' : '';
   if (history.length < 1) return;
 
-  const labels = history.map(h => (h.timestamp || '').slice(5, 16).replace('T', ' '));
+  const labels = history.map(h => utcToEstShort(h.timestamp));
 
   const brierData = history.map(h => +(h.brier || 0).toFixed(4));
   const ocData = history.map(h => +(h.overconfidence || 0).toFixed(3));
