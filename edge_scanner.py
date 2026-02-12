@@ -403,15 +403,20 @@ CATEGORY_CONFIGS = {
 def _apply_dashboard_overrides():
     """
     Load config overrides from the dashboard JSON file and apply to CATEGORY_CONFIGS.
-    The dashboard writes per-category min_edge_pct values to this file.
+    The dashboard writes per-category min_edge_pct and global profit_margin values.
     Called at the start of each scan cycle so changes take effect within ~15s.
     """
+    global CALIBRATION_PROFIT_MARGIN
     if not os.path.exists(OVERRIDES_PATH):
         return
     try:
         with open(OVERRIDES_PATH, "r") as f:
             overrides = json.load(f)
         for cat_key, vals in overrides.items():
+            if cat_key == "_global":
+                if "profit_margin" in vals:
+                    CALIBRATION_PROFIT_MARGIN = max(0.0, min(30.0, float(vals["profit_margin"])))
+                continue
             if cat_key in CATEGORY_CONFIGS and "min_edge_pct" in vals:
                 new_val = max(5.0, min(50.0, float(vals["min_edge_pct"])))
                 CATEGORY_CONFIGS[cat_key].min_edge_pct = new_val

@@ -374,9 +374,48 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   </div>
 </div>
 
+<!-- Calibrated Edge Requirements -->
+<div class="config-section">
+  <h2>Edge Requirements — Calibration-Driven</h2>
+  <div style="display:flex; gap:24px; flex-wrap:wrap; align-items:flex-start">
+    <div style="flex:1; min-width:400px">
+      <table>
+        <thead>
+          <tr>
+            <th>FV Bucket</th>
+            <th>Actual WR</th>
+            <th>Breakeven</th>
+            <th>Required Edge</th>
+            <th>n</th>
+            <th>Status</th>
+          </tr>
+        </thead>
+        <tbody id="cal-edge-table"></tbody>
+      </table>
+    </div>
+    <div style="min-width:260px">
+      <div style="margin-bottom:16px">
+        <div style="font-size:10px; color:#64748b; text-transform:uppercase; letter-spacing:0.05em; margin-bottom:6px">Profit Margin (on top of breakeven)</div>
+        <div class="edge-control">
+          <input type="range" min="0" max="30" step="1" id="profit-margin-slider"
+            oninput="onMarginChange(this.value)"
+            onchange="onMarginCommit(this.value)" />
+          <span class="edge-val" id="profit-margin-val">10%</span>
+          <span class="edge-saved" id="profit-margin-saved">saved</span>
+        </div>
+      </div>
+      <div style="font-size:10px; color:#64748b; line-height:1.5">
+        Required edge = breakeven + margin.<br>
+        Breakeven = (1 − actual_wr / model_fair) × 100.<br>
+        Buckets with &lt;10 samples use fallback base edge.
+      </div>
+    </div>
+  </div>
+</div>
+
 <!-- Category Controls -->
 <div class="config-section">
-  <h2>Category Controls — Min Edge %</h2>
+  <h2>Category Controls — Fallback Base Edge</h2>
   <table>
     <thead>
       <tr>
@@ -385,7 +424,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         <th>Win Rate</th>
         <th>P&L</th>
         <th>Avg Edge</th>
-        <th style="min-width:240px">Min Edge Threshold</th>
+        <th style="min-width:240px">Fallback Edge (no cal. data)</th>
       </tr>
     </thead>
     <tbody id="cat-table"></tbody>
@@ -496,6 +535,93 @@ function onEdgeCommit(catKey, val) {
     const el = document.getElementById('edge-saved-' + catKey);
     if (el) { el.classList.add('show'); setTimeout(() => el.classList.remove('show'), 1500); }
   });
+}
+
+// ── Profit margin slider ─────────────────────────────────────────────────────
+
+let currentProfitMargin = 10.0;
+
+function onMarginChange(val) {
+  currentProfitMargin = parseFloat(val);
+  document.getElementById('profit-margin-val').textContent = val + '%';
+  if (lastData) renderCalEdgeTable(lastData);
+}
+
+function onMarginCommit(val) {
+  fetch('/api/config', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({profit_margin: parseFloat(val)})
+  }).then(r => r.json()).then(d => {
+    const el = document.getElementById('profit-margin-saved');
+    if (el) { el.classList.add('show'); setTimeout(() => el.classList.remove('show'), 1500); }
+  });
+}
+
+// ── Calibrated edge requirements table ───────────────────────────────────────
+
+const CAL_EDGE_BUCKETS = [
+  {lo: 0.05, hi: 0.20, label: '5-20%'},
+  {lo: 0.20, hi: 0.30, label: '20-30%'},
+  {lo: 0.30, hi: 0.40, label: '30-40%'},
+  {lo: 0.40, hi: 0.50, label: '40-50%'},
+  {lo: 0.50, hi: 0.60, label: '50-60%'},
+  {lo: 0.60, hi: 0.70, label: '60-70%'},
+  {lo: 0.70, hi: 0.80, label: '70-80%'},
+  {lo: 0.80, hi: 0.95, label: '80-95%'},
+];
+
+function renderCalEdgeTable(data) {
+  const shadow = data.shadow_settled || [];
+  const margin = currentProfitMargin;
+  let html = '';
+
+  for (const b of CAL_EDGE_BUCKETS) {
+    const inBucket = shadow.filter(t => t.model_fair >= b.lo && t.model_fair < b.hi);
+    const n = inBucket.length;
+    const midFair = (b.lo + b.hi) / 2;
+
+    if (n < 10) {
+      html += `<tr style="opacity:0.4">
+        <td>${b.label}</td><td>—</td><td>—</td><td>—</td>
+        <td>${n}</td><td><span style="color:#64748b">insufficient</span></td>
+      </tr>`;
+      continue;
+    }
+
+    const wins = inBucket.filter(t => t.won === 1).length;
+    const actualWR = wins / n;
+    const breakeven = Math.max(0, (1 - actualWR / midFair) * 100);
+    const required = breakeven + margin;
+    const isBlocked = required > 60;  // max_edge_pct
+    const isProfitable = actualWR > midFair;  // model underestimates
+
+    let statusBadge, reqColor;
+    if (isBlocked) {
+      statusBadge = '<span style="color:#ef4444;font-weight:600">BLOCKED</span>';
+      reqColor = '#ef4444';
+    } else if (isProfitable) {
+      statusBadge = '<span style="color:#22c55e;font-weight:600">SWEET SPOT</span>';
+      reqColor = '#22c55e';
+    } else if (required > 40) {
+      statusBadge = '<span style="color:#f59e0b;font-weight:600">HARD</span>';
+      reqColor = '#f59e0b';
+    } else {
+      statusBadge = '<span style="color:#22d3ee">OK</span>';
+      reqColor = '#22d3ee';
+    }
+
+    html += `<tr>
+      <td>${b.label}</td>
+      <td>${(actualWR * 100).toFixed(1)}%</td>
+      <td>${breakeven.toFixed(1)}%</td>
+      <td style="color:${reqColor};font-weight:700">${required.toFixed(1)}%</td>
+      <td>${n}</td>
+      <td>${statusBadge}</td>
+    </tr>`;
+  }
+
+  document.getElementById('cal-edge-table').innerHTML = html;
 }
 
 // ── Rendering ────────────────────────────────────────────────────────────────
@@ -1099,9 +1225,21 @@ async function refresh() {
     const r = await fetch('/api/data');
     const data = await r.json();
     lastData = data;
+
+    // Initialize profit margin from overrides on first load
+    const savedMargin = data.overrides?._global?.profit_margin;
+    if (savedMargin != null && !window._marginInitialized) {
+      currentProfitMargin = savedMargin;
+      const slider = document.getElementById('profit-margin-slider');
+      if (slider) slider.value = savedMargin;
+      document.getElementById('profit-margin-val').textContent = savedMargin + '%';
+      window._marginInitialized = true;
+    }
+
     renderSummary(data);
     renderBankroll(data);
     renderCalibration(data);
+    renderCalEdgeTable(data);
     renderCatTable(data);
     renderTradesTable(data);
     updateCharts(data);
@@ -1153,6 +1291,21 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(length)) if length > 0 else {}
 
+            overrides = load_overrides()
+
+            # Handle profit margin update (global, not per-category)
+            profit_margin = body.get("profit_margin")
+            if profit_margin is not None:
+                overrides["_global"] = overrides.get("_global", {})
+                overrides["_global"]["profit_margin"] = max(0.0, min(30.0, float(profit_margin)))
+                save_overrides(overrides)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(json.dumps({"ok": True, "profit_margin": overrides["_global"]["profit_margin"]}).encode())
+                return
+
             category = body.get("category", "")
             min_edge = body.get("min_edge_pct")
 
@@ -1166,7 +1319,6 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
             # Clamp to safe range
             min_edge = max(5.0, min(50.0, float(min_edge)))
 
-            overrides = load_overrides()
             if category not in overrides:
                 overrides[category] = {}
             overrides[category]["min_edge_pct"] = min_edge
