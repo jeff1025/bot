@@ -1877,6 +1877,14 @@ class PositionTracker:
         with self._lock:
             return sum(1 for p in self._positions.values() if p.event_ticker == event_ticker)
 
+    def has_yes_in_event(self, event_ticker: str) -> bool:
+        """Check if we already hold a YES position in this event."""
+        with self._lock:
+            return any(
+                p.event_ticker == event_ticker and p.side == "yes"
+                for p in self._positions.values()
+            )
+
 
 # =============================================================================
 # CATEGORY STATS TRACKER — Per-category P&L, win rate, circuit breakers
@@ -2808,10 +2816,6 @@ class EdgeScanner:
         event_ticker = parsed.get("event_ticker", "")
         if event_ticker and self.positions.count_by_event(event_ticker) >= config.max_positions_per_event:
             return None
-        # Range markets: max 1 position per event (brackets are mutually exclusive)
-        if parsed.get("direction") == "range" and event_ticker:
-            if self.positions.count_by_event(event_ticker) >= 1:
-                return None
 
         # Compute fair value (NO orderbook needed)
         cap_strike = parsed.get("cap_strike")
@@ -2883,6 +2887,12 @@ class EdgeScanner:
         else:
             side = "yes" if direction == "up" else "no"
             ask_price = ob.get(f"{side}_ask")
+
+        # Range markets: block duplicate YES (brackets are mutually exclusive)
+        if direction == "range" and side == "yes":
+            evt = candidate.get("event_ticker", "")
+            if evt and self.positions.has_yes_in_event(evt):
+                return None
 
         ask_size = ob.get(f"{side}_ask_size", 0)
 
@@ -3717,9 +3727,9 @@ class EdgeScanner:
             # Event-level limit (correlated risk)
             if config and opp.event_ticker and self.positions.count_by_event(opp.event_ticker) >= config.max_positions_per_event:
                 continue
-            # Range markets: max 1 position per event (brackets are mutually exclusive)
-            if opp.direction == "range" and opp.event_ticker:
-                if self.positions.count_by_event(opp.event_ticker) >= 1:
+            # Range markets: block duplicate YES (brackets are mutually exclusive)
+            if opp.direction == "range" and opp.side == "yes" and opp.event_ticker:
+                if self.positions.has_yes_in_event(opp.event_ticker):
                     continue
 
             trade_id = await self.execute_opportunity(opp)
