@@ -2161,7 +2161,7 @@ CALIBRATION_MIN_SAMPLES = 20  # Don't report metrics until this many shadow sett
 ADAPTIVE_EDGE_PRICE_BANDWIDTH = 0.03    # Gaussian kernel bandwidth in dollars ($0.03)
 ADAPTIVE_EDGE_MIN_WEIGHT = 3.0          # Minimum effective sample weight to produce adjustment
 ADAPTIVE_EDGE_FLOOR_PCT = 15.0          # Hard floor: never require less edge than this
-ADAPTIVE_EDGE_CEILING_PCT = 45.0        # Hard ceiling: never require more edge than this
+ADAPTIVE_EDGE_CEILING_PCT = 55.0        # Hard ceiling: raised to allow low-FV penalty room
 ADAPTIVE_EDGE_MIN_SAMPLES = 30          # Don't activate until this many settled shadow trades
 
 # Per-timeframe recency half-lives (hours): faster markets forget faster
@@ -2185,6 +2185,13 @@ ADAPTIVE_EDGE_WINDOW_BOUNDS = {           # (min_sec, max_sec) per timeframe
 # vs ~57.5% predicted (n=39). Fee diff negligible ($0.02 cap). Crossover at fair=0.75.
 ADAPTIVE_EDGE_FV_BIAS_CENTER = 0.82     # Multiplier at fair=0.50 (18% discount)
 ADAPTIVE_EDGE_FV_BIAS_SLOPE = 0.72      # Additional multiplier per unit distance from 0.50
+
+# Low fair value penalty: cheap contracts (fair < 0.50) need much more edge
+# Multiplier escalates linearly from 1.0 at fair=0.50 to ~2.5 at fair→0
+# Combined with existing FV bias, this creates steep requirements below 0.50
+# At fair=0.30 → req ~39%, fair=0.20 → req ~49%, fair=0.10 → effectively blocked
+LOW_FV_PENALTY_THRESHOLD = 0.50
+LOW_FV_PENALTY_MAX_MULT = 2.5
 
 class CalibrationTracker:
     """
@@ -2517,6 +2524,19 @@ class AdaptiveEdgeManager:
         distance = abs(model_fair - 0.50)
         return ADAPTIVE_EDGE_FV_BIAS_CENTER + distance * ADAPTIVE_EDGE_FV_BIAS_SLOPE
 
+    @staticmethod
+    def _low_fair_value_penalty(model_fair: float) -> float:
+        """Cheap contract penalty: escalating edge multiplier when fair < 0.50.
+
+        Returns 1.0 when fair >= 0.50. Scales linearly below:
+          fair=0.45 → 1.15    fair=0.40 → 1.30    fair=0.30 → 1.60
+          fair=0.20 → 1.90    fair=0.10 → 2.20
+        """
+        if model_fair >= LOW_FV_PENALTY_THRESHOLD:
+            return 1.0
+        shortfall = (LOW_FV_PENALTY_THRESHOLD - model_fair) / LOW_FV_PENALTY_THRESHOLD
+        return 1.0 + shortfall * (LOW_FV_PENALTY_MAX_MULT - 1.0)
+
     def get_required_edge(
         self, asset: str, ask_price: float, base_min_edge: float,
         category: str = "", seconds_left: float = 0.0,
@@ -2535,9 +2555,10 @@ class AdaptiveEdgeManager:
         is insufficient at this point.
         """
         fv_bias = self._fair_value_confidence_bias(model_fair)
+        low_fv = self._low_fair_value_penalty(model_fair)
 
         if not self._active:
-            adjusted = base_min_edge * fv_bias
+            adjusted = base_min_edge * fv_bias * low_fv
             return max(ADAPTIVE_EDGE_FLOOR_PCT, min(ADAPTIVE_EDGE_CEILING_PCT, adjusted))
 
         price_cents = round(ask_price * 100)
@@ -2553,10 +2574,10 @@ class AdaptiveEdgeManager:
         ratio = self._cache.get((asset, price_cents, time_bucket))
         if ratio is None:
             # No learned data at this point — still apply confidence bias
-            adjusted = base_min_edge * fv_bias
+            adjusted = base_min_edge * fv_bias * low_fv
             return max(ADAPTIVE_EDGE_FLOOR_PCT, min(ADAPTIVE_EDGE_CEILING_PCT, adjusted))
 
-        adjusted = base_min_edge * ratio * fv_bias
+        adjusted = base_min_edge * ratio * fv_bias * low_fv
         return max(ADAPTIVE_EDGE_FLOOR_PCT, min(ADAPTIVE_EDGE_CEILING_PCT, adjusted))
 
     def get_state(self) -> dict:
