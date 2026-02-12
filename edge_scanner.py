@@ -41,6 +41,7 @@ import asyncio
 import base64
 import json
 import logging
+from logging.handlers import RotatingFileHandler
 import math
 import os
 import signal
@@ -233,8 +234,8 @@ CATEGORY_CONFIGS = {
         max_edge_pct=60.0,
         max_price=0.75,
         min_price=0.02,
-        min_seconds_to_expiry=180,
-        max_seconds_to_expiry=3300,
+        min_seconds_to_expiry=50,
+        max_seconds_to_expiry=60,
         max_positions_per_category=2,
         max_positions_per_event=2,
         contracts_per_trade=1,
@@ -252,8 +253,8 @@ CATEGORY_CONFIGS = {
         max_edge_pct=60.0,
         max_price=0.75,
         min_price=0.02,
-        min_seconds_to_expiry=180,
-        max_seconds_to_expiry=3300,
+        min_seconds_to_expiry=50,
+        max_seconds_to_expiry=60,
         max_positions_per_category=2,
         max_positions_per_event=2,
         contracts_per_trade=1,
@@ -271,8 +272,8 @@ CATEGORY_CONFIGS = {
         max_edge_pct=60.0,
         max_price=0.75,
         min_price=0.02,
-        min_seconds_to_expiry=180,
-        max_seconds_to_expiry=3300,
+        min_seconds_to_expiry=50,
+        max_seconds_to_expiry=60,
         max_positions_per_category=2,
         max_positions_per_event=2,
         contracts_per_trade=1,
@@ -291,8 +292,8 @@ CATEGORY_CONFIGS = {
         max_edge_pct=60.0,
         max_price=0.75,
         min_price=0.02,
-        min_seconds_to_expiry=90,
-        max_seconds_to_expiry=840,
+        min_seconds_to_expiry=50,
+        max_seconds_to_expiry=60,
         max_positions_per_category=1,
         max_positions_per_event=1,
         contracts_per_trade=1,
@@ -310,8 +311,8 @@ CATEGORY_CONFIGS = {
         max_edge_pct=60.0,
         max_price=0.75,
         min_price=0.02,
-        min_seconds_to_expiry=90,
-        max_seconds_to_expiry=840,
+        min_seconds_to_expiry=50,
+        max_seconds_to_expiry=60,
         max_positions_per_category=1,
         max_positions_per_event=1,
         contracts_per_trade=1,
@@ -329,8 +330,8 @@ CATEGORY_CONFIGS = {
         max_edge_pct=60.0,
         max_price=0.75,
         min_price=0.02,
-        min_seconds_to_expiry=90,
-        max_seconds_to_expiry=840,
+        min_seconds_to_expiry=50,
+        max_seconds_to_expiry=60,
         max_positions_per_category=1,
         max_positions_per_event=1,
         contracts_per_trade=1,
@@ -349,8 +350,8 @@ CATEGORY_CONFIGS = {
         max_edge_pct=60.0,
         max_price=0.75,
         min_price=0.02,
-        min_seconds_to_expiry=90,
-        max_seconds_to_expiry=840,
+        min_seconds_to_expiry=50,
+        max_seconds_to_expiry=60,
         max_positions_per_category=1,
         max_positions_per_event=1,
         contracts_per_trade=1,
@@ -368,8 +369,8 @@ CATEGORY_CONFIGS = {
         max_edge_pct=60.0,
         max_price=0.75,
         min_price=0.02,
-        min_seconds_to_expiry=180,
-        max_seconds_to_expiry=3300,
+        min_seconds_to_expiry=50,
+        max_seconds_to_expiry=60,
         max_positions_per_category=2,
         max_positions_per_event=2,
         contracts_per_trade=1,
@@ -388,8 +389,8 @@ CATEGORY_CONFIGS = {
         max_edge_pct=60.0,
         max_price=0.75,
         min_price=0.02,
-        min_seconds_to_expiry=180,
-        max_seconds_to_expiry=3300,
+        min_seconds_to_expiry=50,
+        max_seconds_to_expiry=60,
         max_positions_per_category=2,
         max_positions_per_event=2,
         contracts_per_trade=1,
@@ -446,7 +447,12 @@ _ch.setFormatter(logging.Formatter(
 logger.addHandler(_ch)
 
 # File handler — DEBUG level (everything)
-_fh = logging.FileHandler(os.path.join(LOG_DIR, "edge_scanner.log"), encoding="utf-8")
+_fh = RotatingFileHandler(
+    os.path.join(LOG_DIR, "edge_scanner.log"),
+    maxBytes=10_000_000,   # 10 MB per file
+    backupCount=3,          # Keep 3 old files (~40 MB total cap)
+    encoding="utf-8",
+)
 _fh.setLevel(logging.DEBUG)
 _fh.setFormatter(logging.Formatter(
     "%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
@@ -961,6 +967,7 @@ class BinanceFallbackFeed:
         self._running = False
         self._callbacks: list = []
         self._last_prices: dict[str, float] = {}
+        self._last_update: dict[str, float] = {}
         self._update_count = 0
 
     def on_price(self, callback):
@@ -994,6 +1001,7 @@ class BinanceFallbackFeed:
                     price = float(data.get("price", 0))
                     if price > 0:
                         self._last_prices[asset] = price
+                        self._last_update[asset] = time.time()
                         self._update_count += 1
                         for cb in self._callbacks:
                             try:
@@ -1006,6 +1014,12 @@ class BinanceFallbackFeed:
 
     def get_price(self, asset: str) -> Optional[float]:
         return self._last_prices.get(asset.upper())
+
+    def is_stale(self, asset: str, max_age: float = 30) -> bool:
+        ts = self._last_update.get(asset.upper())
+        if not ts:
+            return True
+        return (time.time() - ts) > max_age
 
     @property
     def update_count(self) -> int:
@@ -2726,6 +2740,10 @@ class EdgeScanner:
             spot = self.binance_feed.get_price(asset)
         if not spot:
             return None
+        # Reject if both price feeds are stale (e.g. overnight disconnect)
+        if self.chainlink.is_stale(asset, max_age=30) and self.binance_feed.is_stale(asset, max_age=30):
+            logger.debug(f"Stale price for {asset}, skipping")
+            return None
 
         vol = self.vol_tracker.get_adaptive_vol(asset, seconds_left)
         if not vol:
@@ -2749,6 +2767,10 @@ class EdgeScanner:
         if not spot:
             spot = self.binance_feed.get_price(asset)
         if not spot:
+            return None
+        # Reject if both price feeds are stale (e.g. overnight disconnect)
+        if self.chainlink.is_stale(asset, max_age=30) and self.binance_feed.is_stale(asset, max_age=30):
+            logger.debug(f"Stale price for {asset}, skipping")
             return None
 
         vol = self.vol_tracker.get_adaptive_vol(asset, seconds_left)
