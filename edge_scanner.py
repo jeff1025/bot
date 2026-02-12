@@ -2187,11 +2187,12 @@ ADAPTIVE_EDGE_FV_BIAS_CENTER = 0.82     # Multiplier at fair=0.50 (18% discount)
 ADAPTIVE_EDGE_FV_BIAS_SLOPE = 0.72      # Additional multiplier per unit distance from 0.50
 
 # Low fair value penalty: cheap contracts (fair < 0.50) need much more edge
-# Multiplier escalates linearly from 1.0 at fair=0.50 to ~2.5 at fair→0
-# Combined with existing FV bias, this creates steep requirements below 0.50
-# At fair=0.30 → req ~39%, fair=0.20 → req ~49%, fair=0.10 → effectively blocked
+# Multiplier escalates linearly from 1.0 at fair=0.50 to ~4.0 at fair→0
+# Combined with existing FV bias, this makes cheap contracts very hard to trade
+# At fair=0.40 → req ~36%, fair=0.35 → req ~44%, fair=0.30 → req ~53% (clamped 55%)
+# Avg edges run 40-57%, so fair<0.35 is effectively blocked for most assets
 LOW_FV_PENALTY_THRESHOLD = 0.50
-LOW_FV_PENALTY_MAX_MULT = 2.5
+LOW_FV_PENALTY_MAX_MULT = 4.0
 
 class CalibrationTracker:
     """
@@ -2529,8 +2530,8 @@ class AdaptiveEdgeManager:
         """Cheap contract penalty: escalating edge multiplier when fair < 0.50.
 
         Returns 1.0 when fair >= 0.50. Scales linearly below:
-          fair=0.45 → 1.15    fair=0.40 → 1.30    fair=0.30 → 1.60
-          fair=0.20 → 1.90    fair=0.10 → 2.20
+          fair=0.45 → 1.30    fair=0.40 → 1.60    fair=0.35 → 1.90
+          fair=0.30 → 2.20    fair=0.20 → 2.80    fair=0.10 → 3.40
         """
         if model_fair >= LOW_FV_PENALTY_THRESHOLD:
             return 1.0
