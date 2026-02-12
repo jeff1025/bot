@@ -1877,14 +1877,6 @@ class PositionTracker:
         with self._lock:
             return sum(1 for p in self._positions.values() if p.event_ticker == event_ticker)
 
-    def has_yes_in_event(self, event_ticker: str) -> bool:
-        """Check if we already hold a YES position in this event."""
-        with self._lock:
-            return any(
-                p.event_ticker == event_ticker and p.side == "yes"
-                for p in self._positions.values()
-            )
-
 
 # =============================================================================
 # CATEGORY STATS TRACKER — Per-category P&L, win rate, circuit breakers
@@ -2816,9 +2808,9 @@ class EdgeScanner:
         event_ticker = parsed.get("event_ticker", "")
         if event_ticker and self.positions.count_by_event(event_ticker) >= config.max_positions_per_event:
             return None
-        # Range markets: only 1 YES per event (brackets are mutually exclusive)
+        # Range markets: max 1 position per event (brackets are mutually exclusive)
         if parsed.get("direction") == "range" and event_ticker:
-            if self.positions.has_yes_in_event(event_ticker):
+            if self.positions.count_by_event(event_ticker) >= 1:
                 return None
 
         # Compute fair value (NO orderbook needed)
@@ -3725,9 +3717,9 @@ class EdgeScanner:
             # Event-level limit (correlated risk)
             if config and opp.event_ticker and self.positions.count_by_event(opp.event_ticker) >= config.max_positions_per_event:
                 continue
-            # Range markets: only 1 YES per event (brackets are mutually exclusive)
+            # Range markets: max 1 position per event (brackets are mutually exclusive)
             if opp.direction == "range" and opp.event_ticker:
-                if self.positions.has_yes_in_event(opp.event_ticker):
+                if self.positions.count_by_event(opp.event_ticker) >= 1:
                     continue
 
             trade_id = await self.execute_opportunity(opp)
