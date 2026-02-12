@@ -2742,7 +2742,7 @@ class EdgeScanner:
             return None
         # Reject if both price feeds are stale (e.g. overnight disconnect)
         if self.chainlink.is_stale(asset, max_age=30) and self.binance_feed.is_stale(asset, max_age=30):
-            logger.debug(f"Stale price for {asset}, skipping")
+            self._last_scan_diag["stale_price"] += 1
             return None
 
         vol = self.vol_tracker.get_adaptive_vol(asset, seconds_left)
@@ -2770,7 +2770,7 @@ class EdgeScanner:
             return None
         # Reject if both price feeds are stale (e.g. overnight disconnect)
         if self.chainlink.is_stale(asset, max_age=30) and self.binance_feed.is_stale(asset, max_age=30):
-            logger.debug(f"Stale price for {asset}, skipping")
+            self._last_scan_diag["stale_price"] += 1
             return None
 
         vol = self.vol_tracker.get_adaptive_vol(asset, seconds_left)
@@ -2851,6 +2851,7 @@ class EdgeScanner:
             category, asset, strike, seconds_left, direction, cap_strike=cap_strike
         )
         if not fv_result:
+            diag["no_fair_value"] += 1
             return None
         fair, vol, spot = fv_result
 
@@ -3624,6 +3625,8 @@ class EdgeScanner:
             "best_gross_edge": 0.0, "best_ticker": "",
             "near_misses": 0, "no_edge": 0, "price_filtered": 0, "time_filtered": 0,
             "pre_screened": 0, "fv_extreme_filtered": 0, "orderbook_fetched": 0,
+            "no_config": 0, "disabled": 0, "no_vol": 0,
+            "no_fair_value": 0, "stale_price": 0,
         }
         self._last_parse_diag = {
             "total": 0, "status_filtered": 0, "no_close_time": 0,
@@ -3695,12 +3698,15 @@ class EdgeScanner:
         for parsed in parsed_markets:
             config = CATEGORY_CONFIGS.get(parsed["category"])
             if not config or not config.enabled:
+                self._last_scan_diag["no_config"] += 1
                 continue
             if parsed["category"] in self._disabled_categories:
+                self._last_scan_diag["disabled"] += 1
                 continue
 
             # Vol warmup check
             if not self.vol_tracker.is_warmed_up(parsed["asset"]):
+                self._last_scan_diag["no_vol"] += 1
                 continue
 
             candidate = self.pre_evaluate_market(parsed, config)
@@ -3719,16 +3725,26 @@ class EdgeScanner:
             f"top {len(top_candidates)} for orderbook"
         )
 
-        # Log compact diagnostics ONLY when near a close window
+        # Periodic scan summary (every ~30s to avoid spam)
+        if not hasattr(self, '_last_summary_time'):
+            self._last_summary_time = 0
         d = self._last_scan_diag
-        tf = d["time_filtered"]
-        fvx = d["fv_extreme_filtered"]
-        if len(candidates) > 0 or (tf < len(parsed_markets) and len(parsed_markets) > 0):
+        if time.time() - self._last_summary_time >= 30:
+            self._last_summary_time = time.time()
             logger.info(
-                f"WINDOW: {len(parsed_markets)} markets | "
-                f"{len(candidates)} in-window | "
-                f"time_out={tf} fv_extreme={fvx} | "
-                f"top {len(top_candidates)} for orderbook"
+                f"STATUS: {len(parsed_markets)} mkts | "
+                f"no_vol={d['no_vol']} time_out={d['time_filtered']} "
+                f"stale={d['stale_price']} no_fv={d['no_fair_value']} "
+                f"fv_extreme={d['fv_extreme_filtered']} | "
+                f"{len(candidates)} passed"
+            )
+        # Always log immediately when candidates found (active window)
+        if len(candidates) > 0:
+            logger.info(
+                f"ACTIVE: {len(candidates)} candidates | "
+                f"top {len(top_candidates)} for orderbook | "
+                f"stale={d['stale_price']} no_fv={d['no_fair_value']} "
+                f"fv_extreme={d['fv_extreme_filtered']}"
             )
 
         # 5. Fetch orderbook ONLY for top candidates
