@@ -369,7 +369,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   <div class="charts-row" style="max-width:100%;margin:10px 0 0 0" id="cal-history-wrap">
     <div class="chart-wrap full">
       <div class="subtitle">Model Calibration Over Time — Each Point = 10 Settlements</div>
-      <canvas id="calHistoryChart" height="80"></canvas>
+      <canvas id="calHistoryChart" height="130"></canvas>
     </div>
   </div>
 </div>
@@ -784,23 +784,38 @@ function initCharts() {
         ...defaultOpts.plugins,
         legend: { display: true, labels: { color: '#475569', font: { size: 10, family: "'JetBrains Mono'" } } },
       },
-      elements: { point: { radius: 3, hoverRadius: 5 }, line: { tension: 0.3, borderWidth: 2 } },
+      elements: { point: { radius: 5, hoverRadius: 7 }, line: { tension: 0.3, borderWidth: 2.5 } },
       scales: {
         x: { ticks: { color: '#475569', font: { size: 9 }, maxRotation: 0, maxTicksLimit: 12 }, grid: { color: '#1e293b' } },
         yBrier: {
-          type: 'linear', position: 'left', min: 0, max: 0.40,
+          type: 'linear', position: 'left', suggestedMin: 0, suggestedMax: 0.40,
           ticks: { color: '#818cf8', font: { size: 9 } },
           grid: { color: '#1e293b' },
           title: { display: true, text: 'Brier Score', color: '#818cf8', font: { size: 10 } }
         },
         yRatio: {
-          type: 'linear', position: 'right', min: 0.5, max: 2.0,
+          type: 'linear', position: 'right', suggestedMin: 0.5, suggestedMax: 2.0,
           ticks: { color: '#eab308', font: { size: 9 } },
           grid: { drawOnChartArea: false },
           title: { display: true, text: 'Overconfidence', color: '#eab308', font: { size: 10 } }
         }
       }
-    }
+    },
+    plugins: [{
+      afterDatasetsDraw(chart) {
+        if (chart.data.labels.length > 8 || chart.data.labels.length < 1) return;
+        const ctx = chart.ctx;
+        ctx.font = '9px JetBrains Mono';
+        ctx.textAlign = 'center';
+        chart.data.datasets.forEach((ds, i) => {
+          const meta = chart.getDatasetMeta(i);
+          meta.data.forEach((pt, j) => {
+            ctx.fillStyle = ds.borderColor;
+            ctx.fillText(ds.data[j], pt.x, pt.y - 10);
+          });
+        });
+      }
+    }]
   });
 }
 
@@ -1049,15 +1064,31 @@ function renderCalHistory(data) {
     },
     {
       label: 'Overconfidence', data: ocData, yAxisID: 'yRatio',
-      borderColor: '#eab308', backgroundColor: 'transparent',
-      pointBackgroundColor: '#eab308', borderDash: [4, 2],
+      borderColor: '#eab308', backgroundColor: 'rgba(234,179,8,0.08)',
+      fill: true, pointBackgroundColor: '#eab308', borderDash: [4, 2],
     },
     {
       label: 'Actual WR', data: wrData, yAxisID: 'yRatio',
-      borderColor: '#22c55e', backgroundColor: 'transparent',
-      pointBackgroundColor: '#22c55e', borderDash: [2, 2], borderWidth: 1.5,
+      borderColor: '#22c55e', backgroundColor: 'rgba(34,197,94,0.08)',
+      fill: true, pointBackgroundColor: '#22c55e', borderDash: [2, 2], borderWidth: 1.5,
     },
   ];
+
+  // Dynamic y-axis scaling — zoom to actual data range
+  if (brierData.length > 0) {
+    const bMin = Math.min(...brierData), bMax = Math.max(...brierData);
+    const bPad = Math.max(0.03, (bMax - bMin) * 0.4) || 0.05;
+    charts.calHistory.options.scales.yBrier.min = +(Math.max(0, bMin - bPad)).toFixed(2);
+    charts.calHistory.options.scales.yBrier.max = +(bMax + bPad).toFixed(2);
+  }
+  if (ocData.length > 0 && wrData.length > 0) {
+    const allR = [...ocData, ...wrData];
+    const rMin = Math.min(...allR), rMax = Math.max(...allR);
+    const rPad = Math.max(0.05, (rMax - rMin) * 0.4) || 0.1;
+    charts.calHistory.options.scales.yRatio.min = +(Math.max(0, rMin - rPad)).toFixed(2);
+    charts.calHistory.options.scales.yRatio.max = +(rMax + rPad).toFixed(2);
+  }
+
   charts.calHistory.update('none');
 }
 

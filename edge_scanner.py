@@ -578,6 +578,16 @@ def init_db(db_path: str = DB_PATH) -> sqlite3.Connection:
     except Exception:
         pass  # Column already exists
 
+    # Migration: add side column (yes/no) to trades and shadow_trades
+    try:
+        conn.execute("ALTER TABLE trades ADD COLUMN side TEXT")
+    except Exception:
+        pass  # Column already exists
+    try:
+        conn.execute("ALTER TABLE shadow_trades ADD COLUMN side TEXT")
+    except Exception:
+        pass  # Column already exists
+
     conn.execute("""
         CREATE INDEX IF NOT EXISTS idx_trades_unsettled ON trades(settled, close_time)
     """)
@@ -1566,7 +1576,8 @@ class MarketOpportunity:
     event_ticker: str
     category: str           # Key into CATEGORY_CONFIGS
     asset: str              # "BTC", "ETH", "SOL"
-    direction: str          # "up" (YES = above strike) or "down" (NO = below strike)
+    direction: str          # "up" (YES = above strike), "down" (NO = below strike), or "range"
+    side: str               # "yes" or "no" — the side we're buying
     strike: float
     close_time: datetime
     seconds_left: float
@@ -2798,9 +2809,29 @@ class EdgeScanner:
 
         # Get orderbook
         ob = await self.api.get_orderbook(ticker)
-        # For "up"/"range" direction, we buy YES side. For "down", we buy NO side.
-        side = "yes" if direction in ("up", "range") else "no"
-        ask_price = ob.get(f"{side}_ask")
+
+        # Determine side to trade
+        if direction == "range":
+            # Range markets: evaluate both YES and NO, pick better edge
+            yes_ask = ob.get("yes_ask")
+            no_ask = ob.get("no_ask")
+            yes_fair = fair
+            no_fair = 1.0 - fair
+
+            yes_edge = ((yes_fair - yes_ask) / yes_fair * 100) if (yes_fair > 0 and yes_ask and yes_ask > 0) else -999
+            no_edge = ((no_fair - no_ask) / no_fair * 100) if (no_fair > 0 and no_ask and no_ask > 0) else -999
+
+            if no_edge > yes_edge:
+                side = "no"
+                ask_price = no_ask
+                fair = no_fair  # Flip to NO perspective for all downstream calcs
+            else:
+                side = "yes"
+                ask_price = yes_ask
+        else:
+            side = "yes" if direction == "up" else "no"
+            ask_price = ob.get(f"{side}_ask")
+
         ask_size = ob.get(f"{side}_ask_size", 0)
 
         if not ask_price or ask_price <= 0:
@@ -2830,7 +2861,7 @@ class EdgeScanner:
             self._log_shadow_trade(
                 category=category, asset=asset, ticker=ticker,
                 event_ticker=candidate.get("event_ticker", ""),
-                direction=direction, strike=strike, spot=spot,
+                direction=direction, side=side, strike=strike, spot=spot,
                 seconds_left=seconds_left, close_time=close_time,
                 model_vol=vol, model_fair=fair, ask_price=ask_price,
                 gross_edge_pct=gross_edge_pct, net_edge_pct=net_edge_pct,
@@ -2864,6 +2895,7 @@ class EdgeScanner:
             category=category,
             asset=asset,
             direction=direction,
+            side=side,
             strike=strike,
             close_time=close_time,
             seconds_left=seconds_left,
@@ -2893,7 +2925,7 @@ class EdgeScanner:
         if contracts <= 0:
             logger.warning(f"Bankroll: insufficient balance for {opp.ticker}")
             return None
-        side = "yes" if opp.direction in ("up", "range") else "no"
+        side = opp.side
         trade_id = f"ES-{int(time.time())}-{uuid.uuid4().hex[:6]}"
 
         # Pre-execution logging
@@ -3024,12 +3056,12 @@ class EdgeScanner:
             self.db.execute(
                 """
                 INSERT OR REPLACE INTO trades (
-                    trade_id, timestamp, category, asset, ticker, direction,
+                    trade_id, timestamp, category, asset, ticker, direction, side,
                     strike, spot_entry, seconds_left, model_vol, model_fair,
                     ask_price, fill_price, edge_pct, implied_vol, vol_regime,
                     contracts, cost, fee, order_id, order_status, paper_trade,
                     close_time, settled, settlement_result, pnl, payout
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     trade_id,
@@ -3038,6 +3070,7 @@ class EdgeScanner:
                     opp.asset,
                     opp.ticker,
                     opp.direction,
+                    opp.side,
                     opp.strike,
                     opp.spot,
                     opp.seconds_left,
@@ -3068,18 +3101,18 @@ class EdgeScanner:
     def _log_shadow_trade(
         self,
         category: str, asset: str, ticker: str, event_ticker: str,
-        direction: str, strike: float, spot: float, seconds_left: float,
+        direction: str, side: str, strike: float, spot: float, seconds_left: float,
         close_time: datetime, model_vol: float, model_fair: float,
         ask_price: float, gross_edge_pct: float, net_edge_pct: float,
         fee: float, implied_vol: Optional[float],
     ):
         """Log a shadow trade — every priced market with positive edge, regardless of threshold."""
         try:
-            # Deduplicate: only log once per ticker+direction per close_time window
+            # Deduplicate: only log once per ticker+direction+side per close_time window
             # (same market scanned every 15s, we only need one entry per market window)
             existing = self.db.execute(
-                "SELECT id FROM shadow_trades WHERE ticker=? AND direction=? AND settled=0 LIMIT 1",
-                (ticker, direction),
+                "SELECT id FROM shadow_trades WHERE ticker=? AND direction=? AND side=? AND settled=0 LIMIT 1",
+                (ticker, direction, side),
             ).fetchone()
             if existing:
                 return  # Already tracking this market
@@ -3087,15 +3120,15 @@ class EdgeScanner:
             self.db.execute(
                 """
                 INSERT INTO shadow_trades (
-                    timestamp, category, asset, ticker, event_ticker, direction,
+                    timestamp, category, asset, ticker, event_ticker, direction, side,
                     strike, spot, seconds_left, close_time,
                     model_vol, model_fair, ask_price,
                     gross_edge_pct, net_edge_pct, fee, implied_vol
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     datetime.now(timezone.utc).isoformat(),
-                    category, asset, ticker, event_ticker, direction,
+                    category, asset, ticker, event_ticker, direction, side,
                     strike, spot, seconds_left,
                     close_time.isoformat() if isinstance(close_time, datetime) else str(close_time),
                     model_vol, model_fair, ask_price,
@@ -3158,7 +3191,7 @@ class EdgeScanner:
             cutoff = (now - timedelta(seconds=30)).isoformat()
             rows = self.db.execute(
                 """
-                SELECT trade_id, ticker, category, direction, contracts, cost, fee, close_time
+                SELECT trade_id, ticker, category, direction, contracts, cost, fee, close_time, side
                 FROM trades
                 WHERE settled=0
                   AND order_status IN ('filled', 'paper_filled')
@@ -3174,7 +3207,7 @@ class EdgeScanner:
             rows = []
 
         for row in rows:
-            trade_id, ticker, category, direction, contracts, cost, fee, close_time_str = row
+            trade_id, ticker, category, direction, contracts, cost, fee, close_time_str, row_side = row
             if trade_id in settled_trade_ids:
                 continue  # Already settled in phase 1
 
@@ -3194,7 +3227,8 @@ class EdgeScanner:
                     continue
 
                 result = settlement.get("result", "")
-                side = "yes" if direction in ("up", "range") else "no"
+                # Use stored side, fall back to direction-based for old trades
+                side = row_side if row_side else ("yes" if direction in ("up", "range") else "no")
                 won = (side == "yes" and result == "yes") or (side == "no" and result == "no")
 
                 payout = contracts * 1.0 if won else 0.0
@@ -3259,7 +3293,7 @@ class EdgeScanner:
         rows = self.db.execute(
             """
             SELECT trade_id, ticker, category, direction, contracts, cost, fee,
-                   close_time, order_status
+                   close_time, order_status, side
             FROM trades
             WHERE settled=0
               AND trade_id LIKE 'ES-%'
@@ -3281,7 +3315,7 @@ class EdgeScanner:
         market_cache = {}
 
         for row in rows:
-            trade_id, ticker, category, direction, contracts, cost, fee, close_time_str, order_status = row
+            trade_id, ticker, category, direction, contracts, cost, fee, close_time_str, order_status, row_side = row
 
             try:
                 # Fetch market data (cached per ticker)
@@ -3308,7 +3342,8 @@ class EdgeScanner:
                 result = market_data.get("result", "")
 
                 if status == "settled" or result in ("yes", "no"):
-                    side = "yes" if direction in ("up", "range") else "no"
+                    # Use stored side, fall back to direction-based for old trades
+                    side = row_side if row_side else ("yes" if direction in ("up", "range") else "no")
                     won = (side == "yes" and result == "yes") or (side == "no" and result == "no")
 
                     payout = (contracts or 0) * 1.0 if won else 0.0
@@ -3347,7 +3382,7 @@ class EdgeScanner:
         # Get unsettled shadow trades whose close_time has passed
         rows = self.db.execute(
             """
-            SELECT id, ticker, direction, close_time, ask_price, fee, model_fair
+            SELECT id, ticker, direction, close_time, ask_price, fee, model_fair, side
             FROM shadow_trades
             WHERE settled=0 AND close_time < ?
             ORDER BY close_time ASC
@@ -3362,7 +3397,7 @@ class EdgeScanner:
         # Batch by unique ticker to avoid duplicate API calls
         ticker_results = {}
         for row in rows:
-            row_id, ticker, direction, close_time_str, ask_price, fee, model_fair = row
+            row_id, ticker, direction, close_time_str, ask_price, fee, model_fair, row_side = row
             if ticker not in ticker_results:
                 try:
                     settlement = await self.api.get_market_settlement(ticker)
@@ -3388,7 +3423,8 @@ class EdgeScanner:
             result = settlement.get("result", "")
 
             # Determine if hypothetical trade would have won
-            side = "yes" if direction in ("up", "range") else "no"
+            # Use stored side, fall back to direction-based for old shadow trades
+            side = row_side if row_side else ("yes" if direction in ("up", "range") else "no")
             won = (side == "yes" and result == "yes") or (side == "no" and result == "no")
 
             # Hypothetical P&L: buy 1 contract at ask_price
