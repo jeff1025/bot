@@ -594,6 +594,12 @@ def init_db(db_path: str = DB_PATH) -> sqlite3.Connection:
     except Exception:
         pass  # Column already exists
 
+    # Migration: add event_ticker column to trades (for position limit tracking across restarts)
+    try:
+        conn.execute("ALTER TABLE trades ADD COLUMN event_ticker TEXT DEFAULT ''")
+    except Exception:
+        pass  # Column already exists
+
     conn.execute("""
         CREATE INDEX IF NOT EXISTS idx_trades_unsettled ON trades(settled, close_time)
     """)
@@ -3118,12 +3124,13 @@ class EdgeScanner:
             self.db.execute(
                 """
                 INSERT OR REPLACE INTO trades (
-                    trade_id, timestamp, category, asset, ticker, direction, side,
+                    trade_id, timestamp, category, asset, ticker, event_ticker,
+                    direction, side,
                     strike, spot_entry, seconds_left, model_vol, model_fair,
                     ask_price, fill_price, edge_pct, implied_vol, vol_regime,
                     contracts, cost, fee, order_id, order_status, paper_trade,
                     close_time, settled, settlement_result, pnl, payout
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     trade_id,
@@ -3131,6 +3138,7 @@ class EdgeScanner:
                     opp.category,
                     opp.asset,
                     opp.ticker,
+                    opp.event_ticker,
                     opp.direction,
                     opp.side,
                     opp.strike,
@@ -3906,6 +3914,68 @@ class EdgeScanner:
         lines.append(f"{'='*70}")
         print("\n".join(lines))
 
+    def _restore_state_from_db(self):
+        """Reload open positions and recent trade count from database after restart."""
+        # 1. Restore open positions (unsettled, non-rejected trades)
+        now = datetime.now(timezone.utc)
+        rows = self.db.execute(
+            """
+            SELECT trade_id, ticker, event_ticker, category, asset, direction, side,
+                   contracts, fill_price, cost, fee, order_id, timestamp, close_time
+            FROM trades
+            WHERE settled = 0
+              AND order_status NOT IN ('rejected', 'unfilled', 'no_fill')
+            """
+        ).fetchall()
+
+        for row in rows:
+            try:
+                close_time = datetime.fromisoformat(row[13]) if row[13] else now
+            except (ValueError, TypeError):
+                continue
+            # Skip if already expired
+            if close_time < now:
+                continue
+            pos = OpenPosition(
+                trade_id=row[0],
+                ticker=row[1],
+                event_ticker=row[2] or "",
+                category=row[3],
+                asset=row[4],
+                direction=row[5],
+                side=row[6] or "yes",
+                contracts=row[7],
+                entry_price=row[8] or 0,
+                cost=row[9] or 0,
+                fee=row[10] or 0,
+                order_id=row[11] or "",
+                opened_at=datetime.fromisoformat(row[12]) if row[12] else now,
+                close_time=close_time,
+            )
+            self.positions.add(pos)
+
+        if self.positions.count_total() > 0:
+            logger.info(f"RESTORE: Loaded {self.positions.count_total()} open positions from previous session")
+
+        # 2. Restore hourly trade count
+        rows = self.db.execute(
+            """
+            SELECT timestamp FROM trades
+            WHERE timestamp > datetime('now', '-1 hour')
+              AND order_status NOT IN ('rejected', 'unfilled', 'no_fill')
+            """
+        ).fetchall()
+
+        for row in rows:
+            try:
+                ts = datetime.fromisoformat(row[0])
+                self._hourly_trades.append(ts.timestamp())
+            except (ValueError, TypeError):
+                pass
+
+        if self._hourly_trades:
+            logger.info(f"RESTORE: {len(self._hourly_trades)} trades in last hour toward hourly limit")
+
     # ── Main Run Loop ───────────────────────────────────────────────────────
 
     async def run(self):
@@ -3933,6 +4003,9 @@ class EdgeScanner:
 
         # Backfill unsettled trades from previous sessions
         await self.backfill_unsettled_trades()
+
+        # Restore position tracker and hourly trade count from DB
+        self._restore_state_from_db()
 
         # Initialize adaptive edge from existing shadow trade history
         self.adaptive_edge.refresh()
