@@ -171,6 +171,22 @@ def get_dashboard_data() -> dict:
         except Exception:
             pass  # Table may not exist yet
 
+        # Calibration history (time-series snapshots)
+        cal_history = []
+        try:
+            for row in db.execute(
+                "SELECT timestamp, brier, overconfidence, predicted_wr, actual_wr, n, asset_bias "
+                "FROM calibration_snapshots ORDER BY timestamp ASC LIMIT 500"
+            ):
+                entry = dict(row)
+                try:
+                    entry["asset_bias"] = json.loads(entry.get("asset_bias") or "{}")
+                except (json.JSONDecodeError, TypeError):
+                    entry["asset_bias"] = {}
+                cal_history.append(entry)
+        except Exception:
+            pass  # Table may not exist yet
+
         db.close()
 
         return {
@@ -185,6 +201,7 @@ def get_dashboard_data() -> dict:
             "calibration": calibration,
             "shadow_settled": shadow_settled,
             "shadow_pending": shadow_pending,
+            "cal_history": cal_history,
         }
     except Exception as e:
         db.close()
@@ -349,6 +366,12 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <div class="bankroll-section" id="calibration-section">
   <h3>Model Calibration</h3>
   <div class="bankroll-row" id="calibration-panel"></div>
+  <div class="charts-row" style="max-width:100%;margin:10px 0 0 0" id="cal-history-wrap">
+    <div class="chart-wrap full">
+      <div class="subtitle">Model Calibration Over Time — Each Point = 10 Settlements</div>
+      <canvas id="calHistoryChart" height="80"></canvas>
+    </div>
+  </div>
 </div>
 
 <!-- Category Controls -->
@@ -750,6 +773,35 @@ function initCharts() {
       elements: { point: { radius: 1 }, line: { tension: 0.2, borderWidth: 2 } },
     }
   });
+
+  // Calibration history (dual Y-axis: Brier + Overconfidence over time)
+  charts.calHistory = new Chart(document.getElementById('calHistoryChart'), {
+    type: 'line',
+    data: { labels: [], datasets: [] },
+    options: {
+      ...defaultOpts,
+      plugins: {
+        ...defaultOpts.plugins,
+        legend: { display: true, labels: { color: '#475569', font: { size: 10, family: "'JetBrains Mono'" } } },
+      },
+      elements: { point: { radius: 3, hoverRadius: 5 }, line: { tension: 0.3, borderWidth: 2 } },
+      scales: {
+        x: { ticks: { color: '#475569', font: { size: 9 }, maxRotation: 0, maxTicksLimit: 12 }, grid: { color: '#1e293b' } },
+        yBrier: {
+          type: 'linear', position: 'left', min: 0, max: 0.40,
+          ticks: { color: '#818cf8', font: { size: 9 } },
+          grid: { color: '#1e293b' },
+          title: { display: true, text: 'Brier Score', color: '#818cf8', font: { size: 10 } }
+        },
+        yRatio: {
+          type: 'linear', position: 'right', min: 0.5, max: 2.0,
+          ticks: { color: '#eab308', font: { size: 9 } },
+          grid: { drawOnChartArea: false },
+          title: { display: true, text: 'Overconfidence', color: '#eab308', font: { size: 10 } }
+        }
+      }
+    }
+  });
 }
 
 function updateCharts(data) {
@@ -972,6 +1024,41 @@ function renderShadowAnalysis(data) {
   }
 }
 
+// ── Calibration History ──────────────────────────────────────────────────────
+
+function renderCalHistory(data) {
+  const history = data.cal_history || [];
+  const wrap = document.getElementById('cal-history-wrap');
+  if (wrap) wrap.style.display = history.length < 2 ? 'none' : '';
+  if (history.length < 2) return;
+
+  const labels = history.map(h => (h.timestamp || '').slice(5, 16).replace('T', ' '));
+
+  const brierData = history.map(h => +(h.brier || 0).toFixed(4));
+  const ocData = history.map(h => +(h.overconfidence || 0).toFixed(3));
+  const wrData = history.map(h => +((h.actual_wr || 0) / 100).toFixed(3));
+
+  charts.calHistory.data.labels = labels;
+  charts.calHistory.data.datasets = [
+    {
+      label: 'Brier Score', data: brierData, yAxisID: 'yBrier',
+      borderColor: '#818cf8', backgroundColor: 'rgba(129,140,248,0.15)',
+      fill: true, pointBackgroundColor: '#818cf8',
+    },
+    {
+      label: 'Overconfidence', data: ocData, yAxisID: 'yRatio',
+      borderColor: '#eab308', backgroundColor: 'transparent',
+      pointBackgroundColor: '#eab308', borderDash: [4, 2],
+    },
+    {
+      label: 'Actual WR', data: wrData, yAxisID: 'yRatio',
+      borderColor: '#22c55e', backgroundColor: 'transparent',
+      pointBackgroundColor: '#22c55e', borderDash: [2, 2], borderWidth: 1.5,
+    },
+  ];
+  charts.calHistory.update('none');
+}
+
 // ── Fetch & refresh ──────────────────────────────────────────────────────────
 
 async function refresh() {
@@ -986,6 +1073,7 @@ async function refresh() {
     renderTradesTable(data);
     updateCharts(data);
     renderShadowAnalysis(data);
+    renderCalHistory(data);
   } catch (e) {
     console.error('Refresh error:', e);
   }

@@ -582,6 +582,24 @@ def init_db(db_path: str = DB_PATH) -> sqlite3.Connection:
         CREATE INDEX IF NOT EXISTS idx_trades_unsettled ON trades(settled, close_time)
     """)
 
+    # Calibration history snapshots (one row per ~10 shadow settlements)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS calibration_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            brier REAL NOT NULL,
+            overconfidence REAL NOT NULL,
+            predicted_wr REAL NOT NULL,
+            actual_wr REAL NOT NULL,
+            n INTEGER NOT NULL,
+            asset_bias TEXT,
+            lookback_days INTEGER
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_cal_snap_ts ON calibration_snapshots(timestamp)
+    """)
+
     conn.commit()
     return conn
 
@@ -2171,6 +2189,7 @@ class CalibrationTracker:
     def __init__(self, db: sqlite3.Connection):
         self.db = db
         self._state: dict = {}
+        self._settlements_since_snapshot: int = 0
 
     def compute(self, lookback_days: int = 7) -> dict:
         """Compute calibration metrics from recent shadow trades."""
@@ -2259,6 +2278,43 @@ class CalibrationTracker:
                 json.dump(self._state, f, indent=2)
         except Exception:
             pass
+
+    def record_snapshot(self, db: sqlite3.Connection, settled_count: int):
+        """Record a calibration snapshot every 10 shadow settlements for history chart."""
+        self._settlements_since_snapshot += settled_count
+        if self._settlements_since_snapshot < 10:
+            return
+        self._settlements_since_snapshot = 0
+
+        if not self._state.get("sufficient"):
+            return
+
+        try:
+            db.execute(
+                """
+                INSERT INTO calibration_snapshots
+                (timestamp, brier, overconfidence, predicted_wr, actual_wr, n, asset_bias, lookback_days)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    datetime.now(timezone.utc).isoformat(),
+                    self._state["brier"],
+                    self._state["overconfidence"],
+                    self._state["predicted_wr"],
+                    self._state["actual_wr"],
+                    self._state["n"],
+                    json.dumps(self._state.get("asset_bias", {})),
+                    self._state.get("lookback_days", 7),
+                ),
+            )
+            db.commit()
+
+            # Prune old snapshots (keep last 14 days)
+            cutoff = (datetime.now(timezone.utc) - timedelta(days=14)).isoformat()
+            db.execute("DELETE FROM calibration_snapshots WHERE timestamp < ?", (cutoff,))
+            db.commit()
+        except Exception as e:
+            logger.debug(f"Calibration snapshot error: {e}")
 
 
 # =============================================================================
@@ -3340,6 +3396,7 @@ class EdgeScanner:
             # Update calibration metrics after new settlements
             self.calibration.compute()
             self.calibration.write_state_file()
+            self.calibration.record_snapshot(self.db, settled_count)
             warn = self.calibration.should_warn()
             if warn:
                 logger.warning(f"CALIBRATION: {warn}")
